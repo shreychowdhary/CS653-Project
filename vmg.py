@@ -87,10 +87,10 @@ def mixed_partial(f, orders: MultiIndex):
 # --- [Physical Constants and Model Definition] ---
 
 G = 3 + 3j
-delta = 1
+delta = 0
 U = 1
-gamma = 10
-eta = 0
+gamma = 0
+eta = 1
 
 def calculate_covariance(covariance_params):
     r, phi = covariance_params
@@ -172,8 +172,8 @@ def geometric_tensor(params):
     def total_gen_func(params_a, params_b):
         params_a = duplicate_with_neg_mean(params_a)
         params_b = duplicate_with_neg_mean(params_b)
-        params_a = params_a.at[:,0].set(params_a[:,0]**2/jnp.sum(params_a[:,0]**2))
-        params_b = params_b.at[:,0].set(params_b[:,0]**2/jnp.sum(params_b[:,0]**2))
+        params_a = params_a.at[:,0].set(params_a[:,0]/jnp.sum(params_a[:,0]))
+        params_b = params_b.at[:,0].set(params_b[:,0]/jnp.sum(params_b[:,0]))
         return jnp.sum(jax.vmap(lambda param_a: jax.vmap(lambda param_b: generating_function(param_a, param_b, jnp.zeros((4))))(params_a))(params_b))
     return jax.jacfwd(jax.grad(total_gen_func, argnums=(1)), argnums=(0))(params, params).reshape(params.size, params.size)
 
@@ -202,7 +202,7 @@ def u_term(param_a, param_b):
     total += -0.25*g(param_a, param_b, (1,0,0,3))
     total += -0.25*g(param_a, param_b, (1,0,2,1))
     total += 0.25*g(param_a, param_b, (0,1,1,2))
-    return U*total
+    return U/2*total
 
 def single_photon_loss_term(param_a, param_b):
     total = g(param_a, param_b, (1, 0, 1, 0))
@@ -234,8 +234,8 @@ def double_photon_loss_term(param_a, param_b):
 def all_terms(params_a, params_b):
     params_a = duplicate_with_neg_mean(params_a)
     params_b = duplicate_with_neg_mean(params_b)
-    params_a = params_a.at[:,0].set(params_a[:,0]**2/jnp.sum(params_a[:,0]**2))
-    params_b = params_b.at[:,0].set(params_b[:,0]**2/jnp.sum(params_b[:,0]**2))
+    params_a = params_a.at[:,0].set(params_a[:,0]/jnp.sum(params_a[:,0]))
+    params_b = params_b.at[:,0].set(params_b[:,0]/jnp.sum(params_b[:,0]))
     def func(param_a, param_b):
         return g_term(param_a, param_b) + delta_term(param_a, param_b) + u_term(param_a, param_b) + single_photon_loss_term(param_a, param_b) + double_photon_loss_term(param_a, param_b)
     return jnp.sum(jax.vmap(lambda param_a: jax.vmap(lambda param_b: func(param_a, param_b))(params_b))(params_a))
@@ -246,13 +246,13 @@ def liouvillian_gradient(params):
 @jax.jit
 def number_operator(params):
     params = duplicate_with_neg_mean(params)
-    params = params.at[:,0].set(params[:,0]**2/jnp.sum(params[:,0]**2))
+    params = params.at[:,0].set(params[:,0]/jnp.sum(params[:,0]))
     # Vectorized helper for number operator within vmap
     def single_param_n(p):
         normalization, mean, covariance_params = unwrap_params(p)
         covariance = calculate_covariance(covariance_params)
         mean = mean[::2]+ 1j* mean[1::2]
-        return normalization*(jnp.sum(jnp.abs(mean)**2)+covariance[0,0]+covariance[1,1]-1)/2
+        return normalization*(jnp.sum(jnp.real(mean**2))+covariance[0,0]+covariance[1,1]-1)/2
     
     return jnp.sum(jax.vmap(single_param_n)(params))
 
@@ -260,19 +260,17 @@ def number_operator(params):
 def parity_operator(params):
     # Vectorized helper for parity operator within vmap
     params = duplicate_with_neg_mean(params)
-    params = params.at[:,0].set(params[:,0]**2/jnp.sum(params[:,0]**2))
+    params = params.at[:,0].set(params[:,0]/jnp.sum(params[:,0]))
     def single_param_parity(p):
         normalization, mean, covariance_params = unwrap_params(p)
         covariance = calculate_covariance(covariance_params)
         mean = mean[::2]+ 1j* mean[1::2] # Used in original, but math below uses real vector mean
-        # Note: Original code had -mean. 
-        # exp(-0.5 * (-mean) @ inv(cov) @ (-mean)) is same as exp(-0.5 * mean @ inv(cov) @ mean)
         term = jnp.exp(-0.5 * jnp.dot(-mean, jnp.dot(jla.inv(covariance), -mean)))
         return jnp.pi * normalization * jnp.real(term) / jnp.sqrt((2*jnp.pi)**2 * jnp.linalg.det(covariance))
 
     return jnp.sum(jax.vmap(single_param_parity)(params))
 
-def plot_wigner(params, filename):
+def plot_wigner(params, filename, exact_state=None):
     x = jnp.linspace(-5, 5, 100)
     p = jnp.linspace(-5, 5, 100)
     X, P = jnp.meshgrid(x, p)
@@ -281,7 +279,7 @@ def plot_wigner(params, filename):
     # We can keep the loop here as visualization is not the bottleneck
     # or vectorize it if needed, but loop is fine for plotting at start/end
     params = duplicate_with_neg_mean(params)
-    params = params.at[:,0].set(params[:,0]**2/jnp.sum(params[:,0]**2))
+    params = params.at[:,0].set(params[:,0]/jnp.sum(params[:,0]))
     for param in params:
         normalization, mean, covariance_params = unwrap_params(param)
         covariance = calculate_covariance(covariance_params)
@@ -295,11 +293,15 @@ def plot_wigner(params, filename):
         W += normalization/(2*jnp.pi*jnp.sqrt(det_cov)) * jnp.real(jnp.exp(exponent))
         
     norm = matplotlib.colors.Normalize(-abs(W).max(), abs(W).max())
-    plt.figure()
-    plt.contourf(X, P, W, levels=100, cmap='RdBu_r', norm=norm)
-    plt.colorbar()
-    plt.xlabel('X')
-    plt.ylabel('P')
+    fig, ax = plt.subplots(1, 3, figsize=(18, 5))
+    cf = ax[0].contourf(X, P, W, levels=200, cmap='RdBu_r', norm=norm)
+    fig.colorbar(cf, ax=ax[0])
+    if exact_state is not None:
+        qt.plot_wigner(exact_state, xvec=x, yvec=p, ax=ax[1], cmap='RdBu_r', colorbar=True)
+        w_exact = qt.wigner(exact_state, xvec=x, yvec=p)
+        cf_diff = ax[2].contourf(X, P, jnp.abs(w_exact - W), levels=200, cmap='RdBu_r')
+        fig.colorbar(cf_diff, ax=ax[2])
+    
     plt.title('Wigner Function')
     plt.savefig(filename)
 
@@ -307,14 +309,10 @@ def plot_wigner(params, filename):
 
 def initialize_cat_state(alpha=1.0):
     N_G = 4
-    params = jnp.zeros((N_G, 8))
+    params = jnp.zeros((N_G, 7))
     weights = jnp.ones(N_G) 
     params = params.at[:, 0].set(weights)
     params = params.at[2:, 0].set(jnp.exp(-2 * (alpha)**2))
-    
-    vacuum_log_var = 0.5*jnp.log(0.5)
-    params = params.at[:, 5:7].set(vacuum_log_var)
-    params = params.at[:, 7].set(0.0)
     
     dist = jnp.sqrt(2) * alpha
     params = params.at[0, 1].set(dist)
@@ -351,6 +349,8 @@ def expand_state_cluster(params, expansion_factor=4, noise_scale=1e-4, key=None)
         new_centers = base_center + offsets
         new_params = new_params.at[start_idx:end_idx, 1:5].set(new_centers)
         new_params = new_params.at[start_idx:end_idx, 5:7].set(base_cov)
+        random_rots = jax.random.uniform(subkey, (expansion_factor,)) * 2 * jnp.pi
+        new_params = new_params.at[start_idx:end_idx, 6].set(random_rots)
     total_weight = jnp.sum(new_params[:, 0])
     new_params = new_params.at[:, 0].divide(total_weight)
     return new_params
@@ -368,12 +368,11 @@ def compute_update_step(t, params_flat, args):
     T = geometric_tensor(params)
     
     # Regularization
-    reg_strength = 1e-10
+    reg_strength = 1e-4
     reg = reg_strength * jnp.eye(T.shape[0])
     
     # Solve linear system
-    c, low =  jax.scipy.linalg.cho_factor(T+reg)
-    d_params = jax.scipy.linalg.cho_solve((c,low), V)
+    d_params = jla.solve(T + reg, V)
     return d_params.flatten()
 
 def time_evolve(initial_time, end_time):
@@ -425,20 +424,21 @@ def time_evolve(initial_time, end_time):
     means_p = result.expect[1]
     means_n = result.expect[2]
     means_parity = result.expect[3]
-    params = initialize_vacuum_state(1)
-    params = expand_state_cluster(params, expansion_factor=6, noise_scale=1e-4)
+    #params = initialize_cat_state(alpha=2)
+    params = initialize_vacuum_state(N_G=1)
+    params = expand_state_cluster(params, expansion_factor=16, noise_scale=1e-3)
     param_shape = params.shape
     
     # Initial Plot
     print("Plotting initial state...")
-    plot_wigner(params, "initial_state.png")
+    plot_wigner(params, "initial_state.png", exact_state=psi0)
 
     
     print(f"Starting integration from t={initial_time} to {end_time}...")
     term = ODETerm(compute_update_step)
-    solver = Dopri8()
+    solver = diffrax.Tsit5()
     saveat = SaveAt(ts=t_eval)
-    stepsize_controller = PIDController(rtol=1e-4, atol=1e-5)
+    stepsize_controller = PIDController(rtol=1e-3, atol=1e-6)
 
     progress_meter = diffrax.TqdmProgressMeter()
     sol = diffeqsolve(term, solver, t0=initial_time, t1=end_time, dt0=None, y0=params.flatten(), saveat=saveat,
@@ -464,9 +464,9 @@ def time_evolve(initial_time, end_time):
     
     # 6. Final Plot and Analysis
     final_params = time_evolution_params[-1]
-    final_params = final_params.at[:,0].set(final_params[:,0]**2/jnp.sum(final_params[:,0]**2))
+    final_params = final_params.at[:,0].set(final_params[:,0]/jnp.sum(final_params[:,0]))
 
-    plot_wigner(final_params, "final_state.png")
+    plot_wigner(final_params, "final_state.png", exact_state=result.final_state)
     print("Final Time:", t_eval[-1])
     print("Final Params:\n", final_params)
     print("Final Number Operator:", ns[-1])
@@ -504,4 +504,4 @@ def time_evolve(initial_time, end_time):
     plt.tight_layout()
     plt.savefig("observables.png")
 
-time_evolve(0, 1)
+time_evolve(0, 2)
