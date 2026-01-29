@@ -5,6 +5,7 @@ import jax.scipy.linalg as jsl
 import matplotlib.pyplot as plt
 import matplotlib
 from functools import partial
+import matplotlib.animation as animation
 from typing import Union, Tuple, Iterator
 import fractions
 import itertools
@@ -14,6 +15,7 @@ import numpy as np
 from diffrax import diffeqsolve, Dopri8, Tsit5, ODETerm, SaveAt, PIDController
 import diffrax
 import optimistix as optx
+import optax
 
 import jax
 import jax.numpy as jnp
@@ -162,7 +164,7 @@ def gen_func_partial_der(
 
 # --- [Physical Constants and Model Definition] ---
 
-S = 1 + 1j
+S = 8 
 G = 0 + 0j         # Two-photon drive strength
 delta = 1.0        # Detuning
 U = 10           # Kerr nonlinearity
@@ -392,34 +394,52 @@ def expand_state_cluster(params, expansion_factor=4, noise_scale=1e-4, key=None)
     new_params = new_params.at[:, 0].divide(total_weight)
     return new_params
 
-def plot_wigner(params, filename):
+def plot_wigner(params, filename, exact_state=None, num_modes=1):
     x = jnp.linspace(-5, 5, 100)
     p = jnp.linspace(-5, 5, 100)
     X, P = jnp.meshgrid(x, p)
-    W = jnp.zeros(X.shape)
     
+    fig, ax = plt.subplots(num_modes, 3, figsize=(18, 5*num_modes), squeeze=False)
     # We can keep the loop here as visualization is not the bottleneck
     # or vectorize it if needed, but loop is fine for plotting at start/end
     params = renormalize_params(params)
-    for param in params:
-        normalization, mean, covariance_params = unwrap_params(param)
-        covariance = calculate_covariance(covariance_params)
-        det_cov = jla.det(covariance)
-        inv_cov = jla.inv(covariance)
-        phase_vars = jnp.array([X.flatten(), P.flatten()]).T
-        mean = mean[::2]+ 1j* mean[1::2]
-        diff = phase_vars - mean
-        exponent = -0.5 * jnp.einsum("ij,ij->i", jnp.dot(diff, inv_cov), diff)
-        exponent = exponent.reshape(X.shape)
-        W += normalization/(2*jnp.pi*jnp.sqrt(det_cov)) * jnp.real(jnp.exp(exponent))
+    for site in range(num_modes):
+        W = jnp.zeros(X.shape)
+        for param in params:
+            normalization, mean, covariance_params = unwrap_params(param)
+            mean = mean[4*site:4*(site+1)]
+            covariance_params = covariance_params[2*site:2*(site+1)]
+            covariance = calculate_covariance(covariance_params)
+            det_cov = jla.det(covariance)
+            inv_cov = jla.inv(covariance)
+            phase_vars = jnp.array([X.flatten(), P.flatten()]).T
+            mean = mean[::2]+ 1j* mean[1::2]
+            diff = phase_vars - mean
+            exponent = -0.5 * jnp.einsum("ij,ij->i", jnp.dot(diff, inv_cov), diff)
+            exponent = exponent.reshape(X.shape)
+            W += normalization/(2*jnp.pi*jnp.sqrt(det_cov)) * jnp.real(jnp.exp(exponent))
+            
+        norm = matplotlib.colors.Normalize(-abs(W).max(), abs(W).max())
         
-    norm = matplotlib.colors.Normalize(-abs(W).max(), abs(W).max())
-    fig, ax = plt.subplots(1, 3, figsize=(18, 5))
-    cf = ax[0].contourf(X, P, W, levels=200, cmap='RdBu_r', norm=norm)
-    fig.colorbar(cf, ax=ax[0])
+        if exact_state is not None:
+            qt.plot_wigner(exact_state.ptrace(site), xvec=x, yvec=p, ax=ax[site,1], cmap='RdBu_r', colorbar=True)
+            w_exact = qt.wigner(exact_state.ptrace(site), xvec=x, yvec=p)
+            cf_diff = ax[site,2].contourf(X, P, jnp.abs(w_exact - W), levels=200, cmap='RdBu_r')
+            fig.colorbar(cf_diff, ax=ax[site, 2])
+
+        cf = ax[site, 0].contourf(X, P, W, levels=200, cmap='RdBu_r', norm=norm)
+        fig.colorbar(cf, ax=ax[site, 0])
+        ax[site, 0].set_title(f'Wigner Function Site {site}')
     
-    plt.title('Wigner Function')
+    plt.tight_layout()
     plt.savefig(filename)
+    plt.close()
+
+def prune_params(params, threshold=1e-2):
+    params = renormalize_params(params)
+    mask = jnp.abs(params[:, 0]) > threshold
+    new_params = params[mask]
+    return new_params
 
 @jax.jit(static_argnums=(2))
 def compute_update_step(t, flat_params, args):
@@ -432,8 +452,58 @@ def compute_update_step(t, flat_params, args):
 
 
     d_params = jla.solve(T + 1e-12*jnp.eye(T.shape[0]), V)
+   #d_params = jla.pinv(T, rcond=1e-12)@V
 
     return d_params.flatten()
+
+def plot_observables(data, num_modes, exact_result=None, filename="observables.png"):
+    fig, ax = plt.subplots(1, 2, figsize=(18, 5))
+    for t_eval, params in data:
+        for i in range(num_modes):
+            n = jax.vmap(partial(number_operator,mode=i))(params)
+            p = jax.vmap(partial(parity_operator,mode=i))(params)
+            ax[0].plot(t_eval, n, label=f'VMG n{i}')
+            ax[1].plot(t_eval, p, label=f'VMG p{i}')
+            print(f"N{i}: {n[-1]}")
+
+    if exact_result is not None:
+        # Plot Number operators from expect
+        for i in range(num_modes):
+            if i < len(exact_result.expect):
+                 ax[0].plot(exact_result.times, exact_result.expect[i], '--', label=f'Exact n{i}')
+        
+        # Calculate and plot Parity operators from states
+        if hasattr(exact_result, 'states') and len(exact_result.states) > 0:
+            # Infer N from state dimensions
+            dims = exact_result.states[0].dims[0]
+            N = dims[0]
+            
+            a_ops = []
+            for i in range(num_modes):
+                op_list = [qt.qeye(N)] * num_modes
+                op_list[i] = qt.destroy(N)
+                a_ops.append(qt.tensor(op_list))
+            
+            n_ops = [a.dag() * a for a in a_ops]
+            p_ops = [(1j * np.pi * n).expm() for n in n_ops]
+            
+            for i in range(num_modes):
+                p_ex = qt.expect(p_ops[i], exact_result.states)
+                ax[1].plot(exact_result.times, p_ex, '--', label=f'Exact p{i}')
+
+    ax[0].set_xlabel('Time')
+    ax[0].set_ylabel('<n>')
+    ax[0].legend()
+    ax[0].grid(True)
+
+    ax[1].set_xlabel('Time')
+    ax[1].set_ylabel('<p>')
+    ax[1].legend()
+    ax[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
 
 def time_evolve(initial_time, end_time, initial_params):
     steps = 300
@@ -448,7 +518,7 @@ def time_evolve(initial_time, end_time, initial_params):
     solver = diffrax.Dopri8()
     saveat = SaveAt(ts=t_eval)
 
-    stepsize_controller = PIDController(rtol=1e-4, atol=1e-7)
+    stepsize_controller = PIDController(rtol=1e-3, atol=1e-6)
 
     progress_meter = diffrax.TqdmProgressMeter()
     # Flatten params into a pytree-compatible format
@@ -461,27 +531,361 @@ def time_evolve(initial_time, end_time, initial_params):
     
     # 6. Final Plot and Analysis
     final_params = sol.ys[-1].reshape((N_G, -1))
+    final_params = renormalize_params(final_params)
 
     print("Final Time:", t_eval[-1])
     print("Final Params:\n", final_params)
 
-    fig, ax = plt.subplots(1, 2, figsize=(18, 5))
-
-    for i in range(num_modes):
-        n = jax.vmap(partial(number_operator,mode=i))(sol.ys.reshape((steps, N_G, -1)))
-        p = jax.vmap(partial(parity_operator,mode=i))(sol.ys.reshape((steps, N_G, -1)))
-        ax[0].plot(t_eval, n, label=f'n{i}')
-        print(f"N{i}: {n[-1]}")
-
-    ax[0].set_xlabel('Time')
-    ax[0].set_ylabel('<n>')
-    ax[0].legend()
-    ax[0].grid(True)
-
-    plt.tight_layout()
-    plt.savefig("observables.png")
     return sol
 
-params = initialize_vacuum_state(N_G=1, num_modes=3)
-params = expand_state_cluster(params, expansion_factor=40, noise_scale=1e-2)
-sol = time_evolve(0, 10, params)
+def exact_simulation(t, num_sites, t_eval=None):
+    N = 12            # Local Hilbert space cutoff (Keep small for many sites!)
+    if t_eval is None:
+        tlist = np.linspace(0, t, 201)
+    else:
+        tlist = t_eval
+
+    # --- 2. Construct Operators ---
+    # We create a list of annihilation operators for each site in the tensor space
+    a_ops = []
+    for i in range(num_sites):
+        op_list = [qt.qeye(N)] * num_sites
+        op_list[i] = qt.destroy(N)
+        a_ops.append(qt.tensor(op_list))
+
+    # Derived operators
+    n_ops = [a.dag() * a for a in a_ops]
+    x_ops = [(a + a.dag()) / np.sqrt(2) for a in a_ops]
+
+    # --- 3. Build Hamiltonian ---
+    H = (G / 2) * (a_ops[0].dag()**2) + (np.conj(G) / 2) * (a_ops[0]**2)
+    H += (S / 2) * (a_ops[0].dag()) + (np.conj(S) / 2) * (a_ops[0])
+
+    # Local terms: Detuning, Kerr, and Drive
+    for i in range(num_sites):
+        H += -delta * n_ops[i] 
+        H += 0.5 * U * (a_ops[i].dag()**2 * a_ops[i]**2)
+
+    # Interaction terms: Hopping (Nearest Neighbor)
+    for i in range(num_sites - 1):
+        H += -J * (a_ops[i].dag() * a_ops[i+1] + a_ops[i+1].dag() * a_ops[i])
+
+    # --- 4. Dissipation and Initial State ---
+    c_ops = [np.sqrt(gamma) * a for a in a_ops]
+
+    # Initial state: Vacuum on all sites
+    psi0 = qt.tensor([qt.basis(N, 0)] * num_sites)
+
+    # --- 5. Parity Operator ---
+    # Total parity is the product of local parities
+    parity_tot = (1j * np.pi * sum(n_ops)).expm()
+
+    # --- 6. Solve Master Equation ---
+    # Define which expectation values to track
+    e_ops = n_ops + [parity_tot]
+
+    result = qt.mesolve(H, psi0, tlist, c_ops, e_ops=e_ops, options={"store_states":True})
+    return result
+
+def plot_centers(params, filename, site=0):
+    params = renormalize_params(params)
+    weights = params[:, 0]
+    idx_base = 1 + 4 * site
+    x_centers = jnp.real(params[:, idx_base])
+    p_centers = jnp.real(params[:, idx_base + 2])
+
+    plt.figure(figsize=(8, 6))
+    sc = plt.scatter(x_centers, p_centers, c=weights, cmap='viridis', alpha=0.8)
+    plt.colorbar(sc, label='Weight Magnitude')
+    plt.xlabel('X')
+    plt.ylabel('P')
+    plt.title(f'Gaussian Centers Site {site}')
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
+@partial(jax.jit, static_argnums=(3,))
+def compute_total_wigner(params, X, P, site):
+    # params: (N_G, dim)
+    # X, P: (H, W)
+    
+    points = jnp.stack([X.flatten(), P.flatten()], axis=1) # (N_points, 2)
+    
+    def per_gaussian(p):
+        normalization, mean, covariance_params = unwrap_params(p)
+        
+        m_site = mean[4*site:4*(site+1)]
+        cov_p_site = covariance_params[2*site:2*(site+1)]
+        
+        cov = calculate_covariance(cov_p_site)
+        inv_cov = jla.inv(cov)
+        det_cov = jla.det(cov)
+        
+        m_complex = m_site[::2] + 1j * m_site[1::2]
+        diff = points - m_complex[None, :] # (N_points, 2)
+        
+        exponent = -0.5 * jnp.sum(jnp.dot(diff, inv_cov) * diff, axis=1)
+        
+        return normalization / (2 * jnp.pi * jnp.sqrt(det_cov)) * jnp.real(jnp.exp(exponent))
+
+    terms = jax.vmap(per_gaussian)(params) # (N_G, N_points)
+    total = jnp.sum(terms, axis=0) # (N_points,)
+    return total.reshape(X.shape)
+
+def animate_wigner(data, filename, t_eval=None, exact_states=None):
+    x = jnp.linspace(-5, 5, 100)
+    p = jnp.linspace(-5, 5, 100)
+    X, P = jnp.meshgrid(x, p)
+    
+    if len(data) == 0:
+        print("Warning: No data provided for Wigner animation.")
+        return
+
+    num_modes = (data[0].shape[1] - 1) // 6
+    
+    print("Precomputing VMG Wigners...")
+    vmg_wigners = []
+    for site in range(num_modes):
+        wigners_list = []
+        for t in range(len(data)):
+            wigners_list.append(compute_total_wigner(data[t], X, P, site))
+        vmg_wigners.append(jnp.stack(wigners_list))
+
+    exact_wigners = []
+    if exact_states is not None:
+        print("Precomputing Exact Wigners...")
+        for site in range(num_modes):
+            site_wigners = []
+            for t in range(len(exact_states)):
+                rho = exact_states[t].ptrace(site)
+                W = qt.wigner(rho, xvec=x, yvec=p)
+                site_wigners.append(W)
+            exact_wigners.append(np.array(site_wigners))
+            
+    max_diffs = []
+    if exact_states is not None:
+        for site in range(num_modes):
+            diff = jnp.abs(np.array(exact_wigners[site]) - np.array(vmg_wigners[site]))
+            max_val = float(diff.max())
+            max_diffs.append(max_val if max_val > 1e-9 else 1.0)
+    
+    if exact_states is not None:
+        cols = 3
+        figsize = (18, 5 * num_modes)
+    else:
+        cols = 1
+        figsize = (6 * num_modes, 5.5)
+    
+    fig, axes = plt.subplots(num_modes, cols, figsize=figsize, squeeze=False)
+    
+    if exact_states is not None:
+        for site in range(num_modes):
+            norm_diff = matplotlib.colors.LogNorm(vmin=1e-8, vmax=max(max_diffs[site], 1e-5))
+            sm = plt.cm.ScalarMappable(cmap='RdBu_r', norm=norm_diff)
+            sm.set_array([])
+            fig.colorbar(sm, ax=axes[site, 2])
+
+    def update(frame):
+        
+        if t_eval is not None:
+            fig.suptitle(f't = {t_eval[frame]:.3f}', fontsize=14)
+
+        for site in range(num_modes):
+            W_vmg = vmg_wigners[site][frame]
+            vmax = jnp.abs(W_vmg).max()
+            norm = matplotlib.colors.Normalize(-vmax, vmax) if vmax > 1e-9 else None
+            
+            if exact_states is not None:
+                W_exact = exact_wigners[site][frame]
+                W_diff = jnp.abs(W_exact - W_vmg)
+                
+                ax = axes[site, 0]
+                ax.clear()
+                ax.contourf(X, P, W_vmg, levels=100, cmap='RdBu_r', norm=norm)
+                ax.set_title(f'VMG Site {site}')
+                
+                ax = axes[site, 1]
+                ax.clear()
+                ax.contourf(X, P, W_exact, levels=100, cmap='RdBu_r', norm=norm)
+                ax.set_title(f'Exact Site {site}')
+                
+                ax = axes[site, 2]
+                ax.clear()
+                norm_diff = matplotlib.colors.LogNorm(vmin=1e-6, vmax=max(max_diffs[site], 1e-5))
+                ax.contourf(X, P, W_diff + 1e-12, levels=100, cmap='RdBu_r', norm=norm_diff)
+                ax.set_title(f'Diff Site {site}')
+            else:
+                ax = axes[site, 0]
+                ax.clear()
+                ax.contourf(X, P, W_vmg, levels=100, cmap='RdBu_r', norm=norm)
+                ax.set_title(f'Site {site}')
+                ax.set_xlabel('x')
+                ax.set_ylabel('p')
+                ax.set_aspect('equal')
+
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    anim = animation.FuncAnimation(fig, update, frames=len(data), interval=50)
+    anim.save(filename)
+    plt.close(fig)
+
+# --- L2 Projection Pruning Implementation ---
+
+def compute_overlap(params_a, params_b):
+    """
+    Computes the overlap integral <W_a | W_b> using the existing gen_func.
+    Wigner overlap is equivalent to gen_func with J=0.
+    """
+    num_modes = (params_a.shape[1] - 1) // 6
+    zeros = jnp.zeros(4 * num_modes)
+    
+    # We use the existing gen_func which implements Eq A10 from the paper 
+    # calculating the integral of the product of Gaussians.
+    # We map over all pairs (i, j)
+    pairwise_overlaps = jax.vmap(
+        lambda pa: jax.vmap(
+            lambda pb: gen_func(pa, pb, zeros)
+        )(params_b)
+    )(params_a)
+    
+    return jnp.sum(pairwise_overlaps)
+
+@jax.jit
+def l2_loss(params_reduced, params_full):
+    """
+    Calculates L2 distance: || W_reduced - W_full ||^2
+    = <W_r|W_r> + <W_f|W_f> - 2<W_r|W_f>
+    """
+    # Self-interaction of reduced state
+    term_rr = compute_overlap(params_reduced, params_reduced)
+
+    term_ff = compute_overlap(params_full, params_full)
+    
+    # Cross-interaction (Overlap between Reduced and Full)
+    term_rf = compute_overlap(params_reduced, params_full)
+    
+    # Note: term_ff (full-full overlap) is constant w.r.t gradients, 
+    # so we exclude it for optimization speed, but implicitly it completes the square.
+    return term_ff + term_rr - 2 * term_rf
+
+def repulsion_loss(params, threshold=5e-2):
+    num_modes = (params.shape[1] - 1) // 6
+    # Extract centers (real part of means)
+    centers = params[:, 1:(1 + 2 * num_modes):2]
+    # Compute pairwise distances
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dist_sq = jnp.sum(diffs**2, axis=-1)
+    dist = jnp.sqrt(dist_sq + 1e-12) # 1e-12 prevents NaN gradients at 0
+    # Create the "Hinge": value is 0 if dist > threshold
+    # violation = max(0, threshold - dist)
+    penalty = (1.0 / (dist_sq + 1e-12)) - (1.0 / (threshold**2))
+    # Mask diagonal (self-distance is always 0, which triggers violation otherwise)
+    mask = 1.0 - jnp.eye(dist.shape[0])
+    
+    # Sum squared violations
+    return jnp.sum(mask * jax.nn.relu(penalty))
+
+# Update loss function
+def total_loss(params_reduced, params_full):
+    return l2_loss(params_reduced, params_full) + 0.01 * repulsion_loss(params_reduced)
+
+@jax.jit(static_argnums=(2,3))
+def optimize_reduced_state(params_reduced, params_full, steps=200, lr=0.05):
+    """
+    Performs Adam optimization to adjust the parameters of the reduced Gaussians
+    to best fit the full state.
+    """
+    optimizer = optax.adam(learning_rate=lr)
+    opt_state = optimizer.init(params_reduced)
+    
+    def update(i, carry):
+        params, state = carry
+        grads = jax.grad(total_loss)(params, params_full)
+        updates, new_state = optimizer.update(grads, state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_state
+
+    final_params, _ = jax.lax.fori_loop(0, steps, update, (params_reduced, opt_state))
+    return final_params, total_loss(final_params, params_full)
+
+
+def l2_prune_params(original_params, initial_params, target_n_gaussians, optimization_steps=500, lr=0.01):
+    """
+    Reduces the number of Gaussians by:
+    1. Sorting by weight magnitude.
+    2. Keeping the top `target_n_gaussians`.
+    3. Optimizing the remaining Gaussians to minimize L2 error from the original state.
+    """
+    original_params = renormalize_params(original_params)
+    
+    # 1. Selection Strategy: Keep largest weights
+    weights = jnp.abs(initial_params[:, 0])
+    # Get indices of top N weights
+    indices = jnp.argsort(weights)[::-1][:target_n_gaussians]
+    
+    params_reduced_init = initial_params[indices]
+    
+    # Renormalize the initial guess so it sums to 1 before optimization
+    current_weight_sum = jnp.sum(params_reduced_init[:, 0])
+    params_reduced_init = params_reduced_init.at[:, 0].divide(current_weight_sum)
+    
+    print(f"Pruning from {initial_params.shape[0]} to {target_n_gaussians} Gaussians via L2 optimization...")
+    print(f"Start L2 Loss: {total_loss(params_reduced_init, original_params)}")
+
+    # 2. Optimization Strategy: Minimize L2 distance
+    params_optimized, final_loss = optimize_reduced_state(
+        params_reduced_init, 
+        original_params, 
+        steps=optimization_steps, 
+        lr=lr
+    )
+    print(f"Final L2 Loss: {final_loss}")
+    
+    # Final renormalization check
+    return renormalize_params(params_optimized)
+
+end_time = 0.5
+num_modes = 20
+t_eval = np.linspace(0.0, end_time, 300)
+#exact_result = exact_simulation(0.5, num_sites=2, t_eval=t_eval)
+
+
+params = initialize_vacuum_state(N_G=1, num_modes=num_modes)
+params = expand_state_cluster(params, expansion_factor=30, noise_scale=1e-2)
+
+params = l2_prune_params(params, params, target_n_gaussians=30, optimization_steps=2000, lr=0.02)
+plot_wigner(params, "initial_state.png", num_modes=20)
+
+sol = time_evolve(0, end_time, params)
+final_params = sol.ys[-1].reshape((params.shape[0], -1))
+
+plot_wigner(final_params, "final_state_20.png", num_modes=num_modes)
+plot_observables([(t_eval,sol.ys.reshape((300, -1, 6*2+1)))] , num_modes=num_modes, filename="observables_20.png")
+
+#animate_wigner(sol.ys.reshape((300, -1, 6*2+1)), "test_wigner_movie.mp4", t_eval=t_eval, exact_states=exact_result.states)
+
+
+'''
+sol1 = time_evolve(0, 0.3, params)
+
+
+final_params = sol1.ys[-1].reshape((params.shape[0], -1))
+jnp.save("params.npy", final_params)
+
+
+final_params = jnp.load("params.npy")
+
+plot_wigner(final_params, "pre_prune_state.png", site=0)
+params = expand_state_cluster(final_params, expansion_factor=3, noise_scale=5e-2)
+params = l2_prune_params(final_params, params, target_n_gaussians=60, optimization_steps=10000, lr=0.05)
+plot_wigner(params, "post_prune_state.png", site=0)
+plot_centers(params, "post_prune_centers.png", site=0)
+print(params.shape)
+sol2 = time_evolve(0.3, 0.5, params)
+plot_observables([(np.linspace(0.3, 0.5, 300),sol2.ys.reshape((300, -1, 6*2+1)))] , num_modes=2)
+
+final_params = sol2.ys[-1].reshape((params.shape[0], -1))
+plot_wigner(final_params, "final_state.png", exact_state=exact_result.ptrace(0), site=0)
+
+animate_wigner(sol2.ys.reshape((300, -1, 6*2+1)), "wigner_movie.mp4", t_eval=np.linspace(0.3, 0.5, 300))
+'''
