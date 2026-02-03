@@ -128,8 +128,8 @@ def mixed_partial(f, orders: MultiIndex):
     return partial_der
 
 def gen_func_partial_der(
-    param_a,
-    param_b,
+    gaussian_a,
+    gaussian_b,
     orders
 ):
     """
@@ -137,13 +137,13 @@ def gen_func_partial_der(
 
     orders = [(site, phase, multiplicity), ...]
     """
-    num_modes = (param_a.shape[0]-1) // 6
+    num_modes = gaussian_a[1].shape[0]
 
     # Zeroth-order case
     if len(orders) == 0:
         return gen_func(
-            param_a,
-            param_b,
+            gaussian_a,
+            gaussian_b,
             jnp.zeros(num_modes * 4)
         )
 
@@ -155,8 +155,7 @@ def gen_func_partial_der(
         num_modes=num_modes    
     )
 
-    g_f = partial(gen_func, param_a, param_b)
-
+    g_f = partial(gen_func, gaussian_a, gaussian_b)
     return mixed_partial(
         g_f,
         flat_orders
@@ -164,8 +163,8 @@ def gen_func_partial_der(
 
 # --- [Physical Constants and Model Definition] ---
 
-S = 8 
-G = 0 + 0j         # Two-photon drive strength
+S = 8
+G = 0         # Two-photon drive strength
 delta = 1.0        # Detuning
 U = 10           # Kerr nonlinearity
 gamma = 1.0       # Single-photon loss rate
@@ -214,17 +213,18 @@ def covariance_sum_inv(covariance_params_a, covariance_params_b):
     invs = jax.vmap(single_mode_inv)(params_a, params_b)
     return jsl.block_diag(*invs)
 
-def gen_func(params_a, params_b, Js):
-    normalization_a, mean_a, covariance_params_a = unwrap_params(params_a)
-    normalization_b, mean_b, covariance_params_b = unwrap_params(params_b)
-    alpha_a, beta_a = mean_a[::2], mean_a[1::2]
-    alpha_b, beta_b =  mean_b[::2], mean_b[1::2]
+def gen_func(gaussian_a, gaussian_b, Js):
+    normalization_a, param_a = gaussian_a
+    normalization_b, param_b = gaussian_b
+    mean_a, covariance_params_a = unwrap_params(param_a)
+    mean_b, covariance_params_b = unwrap_params(param_b)
+    alpha_a, beta_a = mean_a[:, ::2].flatten(), mean_a[:, 1::2].flatten()
+    alpha_b, beta_b =  mean_b[:, ::2].flatten(), mean_b[:, 1::2].flatten()
     J, J_tilde = Js[:Js.size//2], Js[Js.size//2:]
     
-    num_modes = covariance_params_a.size // 2
+    num_modes = param_a.shape[0]
     covariance_a = calculate_covariance(covariance_params_a)
     covariance_b = calculate_covariance(covariance_params_b)
-    
     covariance_sum = covariance_a + covariance_b
     inv_sigma_sum = covariance_sum_inv(covariance_params_a, covariance_params_b)
     v1 = alpha_b - alpha_a - jnp.dot(covariance_a, J) - J_tilde
@@ -253,162 +253,181 @@ def gen_func(params_a, params_b, Js):
     
     return normalization_a*normalization_b*prefactor * Z1 * (M_minus * C_minus + M_plus * C_plus)
 
-def single_photon_drive(param_a, param_b):
+def single_photon_drive(gaussian_a, gaussian_b):
     total = 0
-    total += jnp.real(S)/jnp.sqrt(2) * gen_func_partial_der(param_a, param_b, [(0,3,1)])
-    total -= jnp.imag(S)/jnp.sqrt(2) * gen_func_partial_der(param_a, param_b, [(0,2,1)])
+    total += jnp.real(S)/jnp.sqrt(2) * gen_func_partial_der(gaussian_a, gaussian_b, [(0,3,1)])
+    total -= jnp.imag(S)/jnp.sqrt(2) * gen_func_partial_der(gaussian_a, gaussian_b, [(0,2,1)])
     return total
 
-def double_photon_drive(param_a, param_b):
+def double_photon_drive(gaussian_a, gaussian_b):
     total = 0
     for i in range(1):
         total += jnp.real(G) * (
-                gen_func_partial_der(param_a, param_b, [(i,1,1), (i,2,1)]) +
-                gen_func_partial_der(param_a, param_b, [(i,0,1), (i,3,1)])
+                gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1)]) +
+                gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,1)])
             )
 
         total -= jnp.imag(G) * (
-            gen_func_partial_der(param_a, param_b, [(i,0,1), (i,2,1)]) -
-            gen_func_partial_der(param_a, param_b, [(i,1,1), (i,3,1)])
+            gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,2,1)]) -
+            gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,3,1)])
         )
     return total
 
-def delta_term(param_a, param_b):
+def delta_term(gaussian_a, gaussian_b):
     total = 0
-    num_modes = (param_a.shape[0]-1) // 6
+    num_modes = gaussian_a[1].shape[0]
 
     for i in range(num_modes):
-        total += gen_func_partial_der(param_a, param_b, [(i,1,1), (i,2,1)]) - gen_func_partial_der(param_a, param_b, [(i,0,1), (i,3,1)])
+        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1)]) - gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,1)])
     return delta * total
 
-def u_term(param_a, param_b):
+def u_term(gaussian_a, gaussian_b):
     total = 0
-    num_modes = (param_a.shape[0]-1) // 6
+    num_modes = gaussian_a[1].shape[0]
 
     for i in range(num_modes):
-        total += gen_func_partial_der(param_a, param_b, [(i,0,3), (i,3,1)])
-        total += gen_func_partial_der(param_a, param_b, [(i,0,1), (i,1,2), (i,3,1)])
-        total += -gen_func_partial_der(param_a, param_b, [(i,0,2), (i,1,1), (i,2,1)])
-        total += -gen_func_partial_der(param_a, param_b, [(i,1,3), (i,2,1)])
-        total += 2 * gen_func_partial_der(param_a, param_b, [(i,1,1), (i,2,1)])
-        total += -2 * gen_func_partial_der(param_a, param_b, [(i,0,1), (i,3,1)])
-        total += 0.25 * gen_func_partial_der(param_a, param_b, [(i,1,1), (i,2,3)])
-        total += -0.25 * gen_func_partial_der(param_a, param_b, [(i,0,1), (i,3,3)])
-        total += -0.25 * gen_func_partial_der(param_a, param_b, [(i,0,1), (i,2,2), (i,3,1)])
-        total += 0.25 * gen_func_partial_der(param_a, param_b, [(i,1,1), (i,2,1), (i,3,2)])
+        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,3), (i,3,1)])
+        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,1,2), (i,3,1)])
+        total += -gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,2), (i,1,1), (i,2,1)])
+        total += -gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,3), (i,2,1)])
+        total += 2 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1)])
+        total += -2 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,1)])
+        total += 0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,3)])
+        total += -0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,3)])
+        total += -0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,2,2), (i,3,1)])
+        total += 0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1), (i,3,2)])
     return U / 2 * total
 
-def single_photon_loss_term(param_a, param_b):
+def single_photon_loss_term(gaussian_a, gaussian_b):
     total = 0
-    num_modes = (param_a.shape[0]-1) // 6
+    num_modes = gaussian_a[1].shape[0]
     for i in range(num_modes):
-        total += gen_func_partial_der(param_a, param_b, [(i,0,1), (i,2,1)])
-        total += gen_func_partial_der(param_a, param_b, [(i,1,1), (i,3,1)])
-        total += 2 * gen_func_partial_der(param_a, param_b, [])
-        total += 0.5 * gen_func_partial_der(param_a, param_b, [(i,2,2)])
-        total += 0.5 * gen_func_partial_der(param_a, param_b, [(i,3,2)])   
+        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,2,1)])
+        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,3,1)])
+        total += 2 * gen_func_partial_der(gaussian_a, gaussian_b, [])
+        total += 0.5 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,2,2)])
+        total += 0.5 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,3,2)])   
     return gamma / 2 * total
 
-def hopping_term(param_a, param_b):
+def hopping_term(gaussian_a, gaussian_b):
     total = 0
-    num_modes = (param_a.shape[0]-1) // 6
+    num_modes = gaussian_a[1].shape[0]
     for i in range(num_modes-1):
-        total += gen_func_partial_der(param_a, param_b, [(i,0,1), (i+1,3,1)])
-        total += gen_func_partial_der(param_a, param_b, [(i+1,0,1), (i,3,1)])
-        total -= gen_func_partial_der(param_a, param_b, [(i,1,1), (i+1,2,1)])
-        total -= gen_func_partial_der(param_a, param_b, [(i+1,1,1), (i,2,1)])
+        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i+1,3,1)])
+        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i+1,0,1), (i,3,1)])
+        total -= gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i+1,2,1)])
+        total -= gen_func_partial_der(gaussian_a, gaussian_b, [(i+1,1,1), (i,2,1)])
     return -J * total
 
-def all_terms(params_a, params_b):
-    def func(param_a, param_b):
-        return double_photon_drive(param_a, param_b) + delta_term(param_a, param_b) + u_term(param_a, param_b) + single_photon_loss_term(param_a, param_b) + hopping_term(param_a, param_b) + single_photon_drive(param_a, param_b)
-    return jnp.sum(jax.vmap(lambda param_a: jax.vmap(lambda param_b: func(param_a, param_b))(params_b))(params_a))
+def all_terms(gaussians_a, gaussians_b):
+    norms_a, params_a = gaussians_a
+    norms_b, params_b = gaussians_b
+    def func(gaussian_a, gaussian_b):
+        return double_photon_drive(gaussian_a, gaussian_b) + delta_term(gaussian_a, gaussian_b) + u_term(gaussian_a, gaussian_b) + single_photon_loss_term(gaussian_a, gaussian_b) + hopping_term(gaussian_a, gaussian_b) + single_photon_drive(gaussian_a, gaussian_b)
+    return jnp.sum(jax.vmap(lambda g_a: jax.vmap(lambda g_b: func(g_a, g_b))((norms_b, params_b)))((norms_a, params_a)))
 
 
-def liouvillian_gradient(params):
-    return jax.grad(all_terms, argnums=0) (params, params)
+def liouvillian_gradient(gaussians):
+    return jax.grad(all_terms, argnums=0)(gaussians, gaussians)
 
-def geometric_tensor(params):
-    num_modes = (params.shape[1]-1)//6
-    def total_gen_func(params_a, params_b):
-        return jnp.sum(jax.vmap(lambda param_a: jax.vmap(lambda param_b: gen_func(param_a, param_b, jnp.zeros(4*num_modes)))(params_a))(params_b))
-    return jax.jacfwd(jax.grad(total_gen_func, argnums=(1)), argnums=(0))(params, params).reshape(params.size, params.size)
+def geometric_tensor(gaussians):
+    norms, params = gaussians
+    num_modes = params.shape[1]
+    N = norms.shape[0]
+    dim_p = num_modes * 6
+    def total_gen_func(gaussians_a, gaussians_b):
+        return jnp.sum(jax.vmap(lambda g_a: jax.vmap(lambda g_b: gen_func(g_a, g_b, jnp.zeros(4*num_modes)))(gaussians_a))(gaussians_b))
+    (T_nn, T_np), (T_pn, T_pp)= jax.jacfwd(jax.grad(total_gen_func, argnums=(1)), argnums=(0))(gaussians, gaussians)
+    
+    T_np_mat = T_np.reshape(N, N * dim_p)
+    T_pn_mat = T_pn.reshape(N * dim_p, N)
+    T_pp_mat = T_pp.reshape(N * dim_p, N * dim_p)
+    
+    T_top = jnp.hstack([T_nn, T_np_mat])
+    T_bot = jnp.hstack([T_pn_mat, T_pp_mat])
+    T_mat = jnp.vstack([T_top, T_bot])
+    return T_mat
 
-def renormalize_params(params):
-    return params.at[:,0].divide(jnp.sum(params[:,0]))
+def renormalize(normalizations):
+    return normalizations/jnp.sum(normalizations)
 
-def number_operator(params, mode):
-    params = renormalize_params(params)
-    def single_param_n(p):
-        normalization, mean, covariance_params = unwrap_params(p)
-        covariance = calculate_covariance(covariance_params[2*mode:2*(mode+1)])
-        mean = mean[4*mode:4*(mode+1):2]+ 1j* mean[4*mode+1:4*(mode+1):2]
+def number_operator(gaussians, mode):
+    normalizations, params = gaussians
+    normalizations = renormalize(normalizations)
+    def single_param_n(gaussian):
+        normalization, param = gaussian
+        mean, covariance_params = unwrap_params(param)
+        covariance = calculate_covariance(covariance_params[mode])
+        mean = mean[mode,::2]+ 1j* mean[mode,1::2]
         return normalization*(jnp.sum(jnp.real(mean**2))+covariance[0,0]+covariance[1,1]-1)/2
     
-    return jnp.sum(jax.vmap(single_param_n)(params))
+    return jnp.sum(jax.vmap(single_param_n)((normalizations, params)))
 
-def parity_operator(params, mode):
-    params = renormalize_params(params)
-    def single_param_parity(p):
-        normalization, mean, covariance_params = unwrap_params(p)
-        covariance = calculate_covariance(covariance_params[2*mode:2*(mode+1)])
-        mean = mean[4*mode:4*(mode+1):2]+ 1j* mean[4*mode+1:4*(mode+1):2]
+def parity_operator(gaussians, mode):
+    normalizations, params = gaussians
+    normalizations = renormalize(normalizations)
+    def single_param_parity(gaussian):
+        normalization, param = gaussian
+        mean, covariance_params = unwrap_params(param)
+        covariance = calculate_covariance(covariance_params[mode])
+        mean = mean[mode,::2]+ 1j* mean[mode,1::2]
         term = jnp.exp(-0.5 * jnp.dot(-mean, jnp.dot(jla.inv(covariance), -mean)))
         return jnp.pi * normalization * jnp.real(term) / jnp.sqrt((2*jnp.pi)**2 * jnp.linalg.det(covariance))
 
-    return jnp.sum(jax.vmap(single_param_parity)(params))
+    return jnp.sum(jax.vmap(single_param_parity)((normalizations, params)))
 
 def unwrap_params(params):
-    num_modes = (params.shape[0] - 1) // 6
-    normalization = params[0]
-    means = params[1:1 + 4 * num_modes]
-    covariances = params[1 + 4 * num_modes:]
-    return normalization, means, covariances
+    means = params[:, :4]
+    covariances = params[:, 4:]
+    return means, covariances
 
 def initialize_vacuum_state(N_G, num_modes=1):
-    params = jnp.zeros((N_G, 1 + 4 * num_modes + 2 * num_modes))
-    params = params.at[:,0].set(1.0 / N_G)  #
-    return params
+    params = jnp.zeros((N_G, num_modes, 6))
+    normalizations = jnp.ones(N_G)/N_G
+    return normalizations, params
 
-def expand_state_cluster(params, expansion_factor=4, noise_scale=1e-4, key=None):
+def expand_state_cluster(gaussians, expansion_factor=4, noise_scale=1e-4, key=None):
     if key is None:
         key = jax.random.PRNGKey(0)
-    num_modes = (params.shape[1] - 1) // 6
-    old_N = params.shape[0]
+    normalizations, params = gaussians
+    num_modes = params.shape[1] 
+    old_N = normalizations.shape[0]
     new_N = old_N * expansion_factor
-    new_params = jnp.zeros((new_N, params.shape[1]))
+    new_params = jnp.zeros((new_N, num_modes, 6))
+    new_normalizations = jnp.zeros(new_N)
     print(f"Expanding ansatz from {old_N} to {new_N} Gaussians...")
     for i in range(old_N):
-        base_weight = params[i, 0]
-        base_center = params[i, 1:1+4*num_modes] # Fixed slicing index from original code
-        base_cov = params[i, 1 + 4 * num_modes:]
+        base_weight = normalizations[i]
+        base_center = params[i, :, :4] # Fixed slicing index from original code
+        base_cov = params[i, :, 4:]
         key, subkey = jax.random.split(key)
-        offsets = jax.random.normal(subkey, (expansion_factor, 4*num_modes)) * noise_scale # Offset for 4 center coords
+        offsets = jax.random.normal(subkey, (expansion_factor, num_modes, 4)) * noise_scale # Offset for 4 center coords
         start_idx = i * expansion_factor
         end_idx = start_idx + expansion_factor
-        new_params = new_params.at[start_idx:end_idx, 0].set(base_weight/expansion_factor)
+        new_normalizations = new_normalizations.at[start_idx:end_idx].set(base_weight/expansion_factor)
         new_centers = base_center + offsets
-        new_params = new_params.at[start_idx:end_idx, 1:1+4*num_modes].set(new_centers)
-        new_params = new_params.at[start_idx:end_idx, 1+4*num_modes:].set(base_cov)
-    total_weight = jnp.sum(new_params[:, 0])
-    new_params = new_params.at[:, 0].divide(total_weight)
-    return new_params
+        new_params = new_params.at[start_idx:end_idx, :, :4].set(new_centers)
+        new_params = new_params.at[start_idx:end_idx, :, 4:].set(base_cov)
+    total_weight = jnp.sum(new_normalizations)
+    new_normalizations = new_normalizations/total_weight
+    return new_normalizations, new_params
 
-def plot_wigner(params, filename, exact_state=None, num_modes=1):
+def plot_wigner(gaussians, filename, exact_state=None):
     x = jnp.linspace(-5, 5, 100)
     p = jnp.linspace(-5, 5, 100)
     X, P = jnp.meshgrid(x, p)
+    num_modes = gaussians[1].shape[1]
     
     fig, ax = plt.subplots(num_modes, 3, figsize=(18, 5*num_modes), squeeze=False)
-    # We can keep the loop here as visualization is not the bottleneck
-    # or vectorize it if needed, but loop is fine for plotting at start/end
-    params = renormalize_params(params)
+    
+    normalizations, params = gaussians
+    normalizations = renormalize(normalizations)
     for site in range(num_modes):
         W = jnp.zeros(X.shape)
-        for param in params:
-            normalization, mean, covariance_params = unwrap_params(param)
-            mean = mean[4*site:4*(site+1)]
-            covariance_params = covariance_params[2*site:2*(site+1)]
+        for normalization, param in zip(normalizations, params):
+            mean, covariance_params = unwrap_params(param)
+            mean = mean[site]
+            covariance_params = covariance_params[site]
             covariance = calculate_covariance(covariance_params)
             det_cov = jla.det(covariance)
             inv_cov = jla.inv(covariance)
@@ -422,6 +441,7 @@ def plot_wigner(params, filename, exact_state=None, num_modes=1):
         norm = matplotlib.colors.Normalize(-abs(W).max(), abs(W).max())
         
         if exact_state is not None:
+            print(site)
             qt.plot_wigner(exact_state.ptrace(site), xvec=x, yvec=p, ax=ax[site,1], cmap='RdBu_r', colorbar=True)
             w_exact = qt.wigner(exact_state.ptrace(site), xvec=x, yvec=p)
             cf_diff = ax[site,2].contourf(X, P, jnp.abs(w_exact - W), levels=200, cmap='RdBu_r')
@@ -435,33 +455,38 @@ def plot_wigner(params, filename, exact_state=None, num_modes=1):
     plt.savefig(filename)
     plt.close()
 
-def prune_params(params, threshold=1e-2):
-    params = renormalize_params(params)
-    mask = jnp.abs(params[:, 0]) > threshold
-    new_params = params[mask]
-    return new_params
-
-@jax.jit(static_argnums=(2))
-def compute_update_step(t, flat_params, args):
-    N_G = args
-    params = flat_params.reshape((N_G,-1))
-    params = renormalize_params(params)
-
-    V = liouvillian_gradient(params).flatten()
-    T = geometric_tensor(params)
-
-
-    d_params = jla.solve(T + 1e-12*jnp.eye(T.shape[0]), V)
-   #d_params = jla.pinv(T, rcond=1e-12)@V
-
-    return d_params.flatten()
+#@jax.jit(static_argnums=(2))
+def compute_update_step(t, gaussians, args):
+    V_pytree = liouvillian_gradient(gaussians)
+    d_norms, d_params = V_pytree
+    
+    N = d_norms.shape[0]
+    num_modes = d_params.shape[1]
+    
+    V_flat = jnp.concatenate([d_norms, d_params.ravel()])
+    
+    T = geometric_tensor(gaussians)
+    d_combined = jla.solve(T + 1e-12*jnp.eye(T.shape[0]), V_flat)
+    
+    d_norms_new = d_combined[:N]
+    d_params_new = d_combined[N:].reshape(N, num_modes, 6)
+    
+    return (d_norms_new, d_params_new)
 
 def plot_observables(data, num_modes, exact_result=None, filename="observables.png"):
     fig, ax = plt.subplots(1, 2, figsize=(18, 5))
-    for t_eval, params in data:
+    for t_eval, gaussians_list in data:
+        # gaussians_list is expected to be a list of (norms, params) or just params if norms are fixed/implicit
+        # If data comes from sol.ys, it is just params.
+        # We need to handle this. For now, assume data is properly formatted or we need to fix the call site.
+        # Given the call site in time_evolve returns sol, and user reshapes sol.ys, we need to zip with norms.
+        
+        # However, to support the tuple structure in vmap, we need a list of tuples.
+        # If gaussians_list is a tuple of arrays (norms_t, params_t), vmap works.
+        
         for i in range(num_modes):
-            n = jax.vmap(partial(number_operator,mode=i))(params)
-            p = jax.vmap(partial(parity_operator,mode=i))(params)
+            n = jax.vmap(partial(number_operator,mode=i))(gaussians_list)
+            p = jax.vmap(partial(parity_operator,mode=i))(gaussians_list)
             ax[0].plot(t_eval, n, label=f'VMG n{i}')
             ax[1].plot(t_eval, p, label=f'VMG p{i}')
             print(f"N{i}: {n[-1]}")
@@ -505,11 +530,13 @@ def plot_observables(data, num_modes, exact_result=None, filename="observables.p
     plt.savefig(filename)
     plt.close()
 
-def time_evolve(initial_time, end_time, initial_params):
+def time_evolve(initial_time, end_time, initial_gaussians):
     steps = 300
     t_eval = jnp.linspace(initial_time, end_time, steps)  
-    N_G = initial_params.shape[0]  
-    num_modes = (initial_params.shape[1] - 1) // 6
+    initial_normalization, initial_params = initial_gaussians
+
+    N_G = initial_normalization.shape[0]  
+    num_modes = initial_params.shape[1]
 
 
     # Log initial observables
@@ -523,19 +550,12 @@ def time_evolve(initial_time, end_time, initial_params):
     progress_meter = diffrax.TqdmProgressMeter()
     # Flatten params into a pytree-compatible format
 
-    sol = diffeqsolve(term, solver, t0=initial_time, t1=end_time, dt0=None, y0=initial_params.flatten(), saveat=saveat,
-                    stepsize_controller=stepsize_controller, max_steps=None, progress_meter=progress_meter, args=N_G)
+    sol = diffeqsolve(term, solver, t0=initial_time, t1=end_time, dt0=None, y0=initial_gaussians, saveat=saveat,
+                    stepsize_controller=stepsize_controller, max_steps=None, progress_meter=progress_meter)
         
     print("Integration complete. Computing observables...")
     print(sol.stats)
     
-    # 6. Final Plot and Analysis
-    final_params = sol.ys[-1].reshape((N_G, -1))
-    final_params = renormalize_params(final_params)
-
-    print("Final Time:", t_eval[-1])
-    print("Final Params:\n", final_params)
-
     return sol
 
 def exact_simulation(t, num_sites, t_eval=None):
@@ -587,13 +607,16 @@ def exact_simulation(t, num_sites, t_eval=None):
     result = qt.mesolve(H, psi0, tlist, c_ops, e_ops=e_ops, options={"store_states":True})
     return result
 
-def plot_centers(params, filename, site=0):
-    params = renormalize_params(params)
-    weights = params[:, 0]
-    idx_base = 1 + 4 * site
-    x_centers = jnp.real(params[:, idx_base])
-    p_centers = jnp.real(params[:, idx_base + 2])
-
+def plot_centers(gaussians, filename, site=0):
+    normalizations, params = gaussians
+    # Assuming weights are normalizations.
+    weights = renormalize(normalizations)
+    x_centers = params[:, site, 0]
+    p_centers = params[:, site, 2] # Assuming x, y, p_x, p_y ordering or similar? 
+    # unwrap_params: means = params[:, :4]. 
+    # mean structure: alpha_a, beta_a. alpha = (q+ip)/sqrt(2)?
+    # The code uses mean[::2] and mean[1::2].
+    
     plt.figure(figsize=(8, 6))
     sc = plt.scatter(x_centers, p_centers, c=weights, cmap='viridis', alpha=0.8)
     plt.colorbar(sc, label='Weight Magnitude')
@@ -605,17 +628,22 @@ def plot_centers(params, filename, site=0):
     plt.close()
 
 @partial(jax.jit, static_argnums=(3,))
-def compute_total_wigner(params, X, P, site):
+def compute_total_wigner(gaussians, X, P, site):
     # params: (N_G, dim)
     # X, P: (H, W)
     
+    norms, params = gaussians
+    norms = renormalize(norms)
+    gaussians = (norms, params)
+    
     points = jnp.stack([X.flatten(), P.flatten()], axis=1) # (N_points, 2)
     
-    def per_gaussian(p):
-        normalization, mean, covariance_params = unwrap_params(p)
+    def per_gaussian(gaussian):
+        normalization, param = gaussian
+        mean, covariance_params = unwrap_params(param)
         
-        m_site = mean[4*site:4*(site+1)]
-        cov_p_site = covariance_params[2*site:2*(site+1)]
+        m_site = mean[site]
+        cov_p_site = covariance_params[site]
         
         cov = calculate_covariance(cov_p_site)
         inv_cov = jla.inv(cov)
@@ -628,7 +656,7 @@ def compute_total_wigner(params, X, P, site):
         
         return normalization / (2 * jnp.pi * jnp.sqrt(det_cov)) * jnp.real(jnp.exp(exponent))
 
-    terms = jax.vmap(per_gaussian)(params) # (N_G, N_points)
+    terms = jax.vmap(per_gaussian)(gaussians) # (N_G, N_points)
     total = jnp.sum(terms, axis=0) # (N_points,)
     return total.reshape(X.shape)
 
@@ -637,18 +665,29 @@ def animate_wigner(data, filename, t_eval=None, exact_states=None):
     p = jnp.linspace(-5, 5, 100)
     X, P = jnp.meshgrid(x, p)
     
-    if len(data) == 0:
-        print("Warning: No data provided for Wigner animation.")
+    if isinstance(data, tuple):
+        norms, params = data
+        num_frames = norms.shape[0]
+        num_modes = params.shape[2]
+        get_state = lambda i: (norms[i], params[i])
+    elif isinstance(data, list):
+        num_frames = len(data)
+        if num_frames == 0:
+            print("Warning: No data provided for Wigner animation.")
+            return
+        sample_params = data[0][1]
+        num_modes = sample_params.shape[1]
+        get_state = lambda i: data[i]
+    else:
+        print("Warning: Unknown data format for Wigner animation.")
         return
-
-    num_modes = (data[0].shape[1] - 1) // 6
     
     print("Precomputing VMG Wigners...")
     vmg_wigners = []
     for site in range(num_modes):
         wigners_list = []
-        for t in range(len(data)):
-            wigners_list.append(compute_total_wigner(data[t], X, P, site))
+        for t in range(num_frames):
+            wigners_list.append(compute_total_wigner(get_state(t), X, P, site))
         vmg_wigners.append(jnp.stack(wigners_list))
 
     exact_wigners = []
@@ -656,7 +695,8 @@ def animate_wigner(data, filename, t_eval=None, exact_states=None):
         print("Precomputing Exact Wigners...")
         for site in range(num_modes):
             site_wigners = []
-            for t in range(len(exact_states)):
+            limit = min(len(exact_states), num_frames)
+            for t in range(limit):
                 rho = exact_states[t].ptrace(site)
                 W = qt.wigner(rho, xvec=x, yvec=p)
                 site_wigners.append(W)
@@ -665,7 +705,8 @@ def animate_wigner(data, filename, t_eval=None, exact_states=None):
     max_diffs = []
     if exact_states is not None:
         for site in range(num_modes):
-            diff = jnp.abs(np.array(exact_wigners[site]) - np.array(vmg_wigners[site]))
+            limit = min(len(exact_wigners[site]), len(vmg_wigners[site]))
+            diff = jnp.abs(np.array(exact_wigners[site][:limit]) - np.array(vmg_wigners[site][:limit]))
             max_val = float(diff.max())
             max_diffs.append(max_val if max_val > 1e-9 else 1.0)
     
@@ -687,7 +728,7 @@ def animate_wigner(data, filename, t_eval=None, exact_states=None):
 
     def update(frame):
         
-        if t_eval is not None:
+        if t_eval is not None and frame < len(t_eval):
             fig.suptitle(f't = {t_eval[frame]:.3f}', fontsize=14)
 
         for site in range(num_modes):
@@ -695,7 +736,7 @@ def animate_wigner(data, filename, t_eval=None, exact_states=None):
             vmax = jnp.abs(W_vmg).max()
             norm = matplotlib.colors.Normalize(-vmax, vmax) if vmax > 1e-9 else None
             
-            if exact_states is not None:
+            if exact_states is not None and frame < len(exact_wigners[site]):
                 W_exact = exact_wigners[site][frame]
                 W_diff = jnp.abs(W_exact - W_vmg)
                 
@@ -725,167 +766,128 @@ def animate_wigner(data, filename, t_eval=None, exact_states=None):
 
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-    anim = animation.FuncAnimation(fig, update, frames=len(data), interval=50)
+    anim = animation.FuncAnimation(fig, update, frames=num_frames, interval=50)
     anim.save(filename)
     plt.close(fig)
 
 # --- L2 Projection Pruning Implementation ---
 
-def compute_overlap(params_a, params_b):
+def compute_overlap(gaussian_a, gaussian_b):
     """
     Computes the overlap integral <W_a | W_b> using the existing gen_func.
     Wigner overlap is equivalent to gen_func with J=0.
     """
-    num_modes = (params_a.shape[1] - 1) // 6
+    # gaussian_a is (norm, param)
+    num_modes = gaussian_a[1].shape[0]
     zeros = jnp.zeros(4 * num_modes)
     
-    # We use the existing gen_func which implements Eq A10 from the paper 
-    # calculating the integral of the product of Gaussians.
-    # We map over all pairs (i, j)
-    pairwise_overlaps = jax.vmap(
-        lambda pa: jax.vmap(
-            lambda pb: gen_func(pa, pb, zeros)
-        )(params_b)
-    )(params_a)
-    
-    return jnp.sum(pairwise_overlaps)
+    return gen_func(gaussian_a, gaussian_b, zeros)
 
 @jax.jit
-def l2_loss(params_reduced, params_full):
+def l2_loss(gaussians_reduced, gaussians_full):
     """
     Calculates L2 distance: || W_reduced - W_full ||^2
     = <W_r|W_r> + <W_f|W_f> - 2<W_r|W_f>
     """
     # Self-interaction of reduced state
-    term_rr = compute_overlap(params_reduced, params_reduced)
+    # vmap over pairs
+    def sum_overlaps(gs_a, gs_b):
+        return jnp.sum(jax.vmap(lambda g_a: jax.vmap(lambda g_b: compute_overlap(g_a, g_b))(gs_b))(gs_a))
 
-    term_ff = compute_overlap(params_full, params_full)
+    term_rr = sum_overlaps(gaussians_reduced, gaussians_reduced)
+    term_ff = sum_overlaps(gaussians_full, gaussians_full)
+    term_rf = sum_overlaps(gaussians_reduced, gaussians_full)
     
-    # Cross-interaction (Overlap between Reduced and Full)
-    term_rf = compute_overlap(params_reduced, params_full)
-    
-    # Note: term_ff (full-full overlap) is constant w.r.t gradients, 
-    # so we exclude it for optimization speed, but implicitly it completes the square.
     return term_ff + term_rr - 2 * term_rf
 
-def repulsion_loss(params, threshold=5e-2):
-    num_modes = (params.shape[1] - 1) // 6
-    # Extract centers (real part of means)
-    centers = params[:, 1:(1 + 2 * num_modes):2]
-    # Compute pairwise distances
-    diffs = centers[:, None, :] - centers[None, :, :]
-    dist_sq = jnp.sum(diffs**2, axis=-1)
-    dist = jnp.sqrt(dist_sq + 1e-12) # 1e-12 prevents NaN gradients at 0
-    # Create the "Hinge": value is 0 if dist > threshold
-    # violation = max(0, threshold - dist)
-    penalty = (1.0 / (dist_sq + 1e-12)) - (1.0 / (threshold**2))
-    # Mask diagonal (self-distance is always 0, which triggers violation otherwise)
-    mask = 1.0 - jnp.eye(dist.shape[0])
+def repulsion_loss(gaussians, threshold=5e-2):
+    norms, params = gaussians
+    # 1. Extract Phase Space Centers (Re(alpha), Re(beta))
+    # Shape: (N_G, num_modes, 2)
+    centers = params[:, :, :4:2] 
     
-    # Sum squared violations
+    centers_flat = centers.reshape(centers.shape[0], -1) 
+    # 3. Compute distances between Gaussians in the full multi-mode phase space
+    diffs = centers_flat[:, None, :] - centers_flat[None, :, :]
+    dist_sq = jnp.sum(diffs**2, axis=-1)
+    
+    penalty = (1.0 / (dist_sq + 1e-12)) - (1.0 / (threshold**2))
+    mask = 1.0 - jnp.eye(dist_sq.shape[0])
+    
     return jnp.sum(mask * jax.nn.relu(penalty))
 
 # Update loss function
-def total_loss(params_reduced, params_full):
-    return l2_loss(params_reduced, params_full) + 0.01 * repulsion_loss(params_reduced)
+def total_loss(gaussians_reduced, gaussians_full):
+    return l2_loss(gaussians_reduced, gaussians_full) + 0.01 * repulsion_loss(gaussians_reduced)
 
 @jax.jit(static_argnums=(2,3))
-def optimize_reduced_state(params_reduced, params_full, steps=200, lr=0.05):
+def optimize_reduced_state(gaussians_reduced, gaussians_full, steps=200, lr=0.05):
     """
     Performs Adam optimization to adjust the parameters of the reduced Gaussians
     to best fit the full state.
     """
     optimizer = optax.adam(learning_rate=lr)
-    opt_state = optimizer.init(params_reduced)
+    opt_state = optimizer.init(gaussians_reduced)
     
     def update(i, carry):
-        params, state = carry
-        grads = jax.grad(total_loss)(params, params_full)
-        updates, new_state = optimizer.update(grads, state, params)
-        new_params = optax.apply_updates(params, updates)
-        return new_params, new_state
+        gaussians, state = carry
+        grads = jax.grad(lambda g: total_loss(g, gaussians_full))(gaussians)
+        updates, new_state = optimizer.update(grads, state, gaussians)
+        new_gaussians = optax.apply_updates(gaussians, updates)
+        return new_gaussians, new_state
 
-    final_params, _ = jax.lax.fori_loop(0, steps, update, (params_reduced, opt_state))
-    return final_params, total_loss(final_params, params_full)
+    final_gaussians, _ = jax.lax.fori_loop(0, steps, update, (gaussians_reduced, opt_state))
+    return final_gaussians, total_loss(final_gaussians, gaussians_full)
 
 
-def l2_prune_params(original_params, initial_params, target_n_gaussians, optimization_steps=500, lr=0.01):
+def l2_prune_params(original_gaussians, initial_gaussians, target_n_gaussians, optimization_steps=500, lr=0.01):
     """
     Reduces the number of Gaussians by:
     1. Sorting by weight magnitude.
     2. Keeping the top `target_n_gaussians`.
     3. Optimizing the remaining Gaussians to minimize L2 error from the original state.
     """
-    original_params = renormalize_params(original_params)
+    # original_gaussians is (norms, params)
+    orig_norms, orig_params = original_gaussians
+    init_norms, init_params = initial_gaussians
     
     # 1. Selection Strategy: Keep largest weights
-    weights = jnp.abs(initial_params[:, 0])
-    # Get indices of top N weights
+    weights = jnp.abs(init_norms)
     indices = jnp.argsort(weights)[::-1][:target_n_gaussians]
     
-    params_reduced_init = initial_params[indices]
+    params_reduced_init = init_params[indices]
+    norms_reduced_init = init_norms[indices]
     
-    # Renormalize the initial guess so it sums to 1 before optimization
-    current_weight_sum = jnp.sum(params_reduced_init[:, 0])
-    params_reduced_init = params_reduced_init.at[:, 0].divide(current_weight_sum)
+    # Renormalize
+    norms_reduced_init = norms_reduced_init / jnp.sum(norms_reduced_init)
     
-    print(f"Pruning from {initial_params.shape[0]} to {target_n_gaussians} Gaussians via L2 optimization...")
-    print(f"Start L2 Loss: {total_loss(params_reduced_init, original_params)}")
+    gaussians_reduced_init = (norms_reduced_init, params_reduced_init)
+    
+    print(f"Pruning from {init_norms.shape[0]} to {target_n_gaussians} Gaussians via L2 optimization...")
+    print(f"Start L2 Loss: {total_loss(gaussians_reduced_init, original_gaussians)}")
 
     # 2. Optimization Strategy: Minimize L2 distance
-    params_optimized, final_loss = optimize_reduced_state(
-        params_reduced_init, 
-        original_params, 
+    gaussians_optimized, final_loss = optimize_reduced_state(
+        gaussians_reduced_init, 
+        original_gaussians, 
         steps=optimization_steps, 
         lr=lr
     )
     print(f"Final L2 Loss: {final_loss}")
     
-    # Final renormalization check
-    return renormalize_params(params_optimized)
+    return gaussians_optimized
 
-end_time = 0.5
-num_modes = 20
+end_time = 0.1
+num_modes = 2
 t_eval = np.linspace(0.0, end_time, 300)
-#exact_result = exact_simulation(0.5, num_sites=2, t_eval=t_eval)
+exact_result = exact_simulation(end_time, num_sites=num_modes, t_eval=t_eval)
 
+gaussians = initialize_vacuum_state(N_G=1, num_modes=num_modes)
+gaussians = expand_state_cluster(gaussians, expansion_factor=60, noise_scale=1e-2)
+gaussians = l2_prune_params(gaussians, gaussians, target_n_gaussians=40, optimization_steps=2000, lr=0.02)
 
-params = initialize_vacuum_state(N_G=1, num_modes=num_modes)
-params = expand_state_cluster(params, expansion_factor=30, noise_scale=1e-2)
-
-params = l2_prune_params(params, params, target_n_gaussians=30, optimization_steps=2000, lr=0.02)
-plot_wigner(params, "initial_state.png", num_modes=20)
-
-sol = time_evolve(0, end_time, params)
-final_params = sol.ys[-1].reshape((params.shape[0], -1))
-
-plot_wigner(final_params, "final_state_20.png", num_modes=num_modes)
-plot_observables([(t_eval,sol.ys.reshape((300, -1, 6*2+1)))] , num_modes=num_modes, filename="observables_20.png")
-
-#animate_wigner(sol.ys.reshape((300, -1, 6*2+1)), "test_wigner_movie.mp4", t_eval=t_eval, exact_states=exact_result.states)
-
-
-'''
-sol1 = time_evolve(0, 0.3, params)
-
-
-final_params = sol1.ys[-1].reshape((params.shape[0], -1))
-jnp.save("params.npy", final_params)
-
-
-final_params = jnp.load("params.npy")
-
-plot_wigner(final_params, "pre_prune_state.png", site=0)
-params = expand_state_cluster(final_params, expansion_factor=3, noise_scale=5e-2)
-params = l2_prune_params(final_params, params, target_n_gaussians=60, optimization_steps=10000, lr=0.05)
-plot_wigner(params, "post_prune_state.png", site=0)
-plot_centers(params, "post_prune_centers.png", site=0)
-print(params.shape)
-sol2 = time_evolve(0.3, 0.5, params)
-plot_observables([(np.linspace(0.3, 0.5, 300),sol2.ys.reshape((300, -1, 6*2+1)))] , num_modes=2)
-
-final_params = sol2.ys[-1].reshape((params.shape[0], -1))
-plot_wigner(final_params, "final_state.png", exact_state=exact_result.ptrace(0), site=0)
-
-animate_wigner(sol2.ys.reshape((300, -1, 6*2+1)), "wigner_movie.mp4", t_eval=np.linspace(0.3, 0.5, 300))
-'''
+sol = time_evolve(0, end_time, gaussians)
+final_state = jax.tree.map(lambda x: x[-1], sol.ys)
+plot_wigner(final_state, "final_state.png", exact_state=exact_result.states[-1])
+plot_observables([(sol.ts, sol.ys)], num_modes, filename="observables.png", exact_result=exact_result)
+animate_wigner(sol.ys, "animation.mp4", t_eval=sol.ts, exact_states=exact_result.states)
