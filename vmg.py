@@ -111,6 +111,10 @@ def mixed_partial(f, orders: MultiIndex):
     using JAX jets. Works for arbitrary dimension.
     """
     d = sum(orders)
+
+    if d == 0:
+        return lambda x0: f(x0)
+    
     ks, cs = precompute_kc(orders)
     dfact = math.factorial(d)
 
@@ -126,40 +130,6 @@ def mixed_partial(f, orders: MultiIndex):
         return jnp.sum(jet_eval(ks) * cs) / dfact
 
     return partial_der
-
-def gen_func_partial_der(
-    gaussian_a,
-    gaussian_b,
-    orders
-):
-    """
-    Evaluate mixed partial of generating_function using structured orders.
-
-    orders = [(site, phase, multiplicity), ...]
-    """
-    num_modes = gaussian_a[1].shape[0]
-
-    # Zeroth-order case
-    if len(orders) == 0:
-        return gen_func(
-            gaussian_a,
-            gaussian_b,
-            jnp.zeros(num_modes * 4)
-        )
-
-    # Convert to hashable tuple for caching
-    orders_tup = tuple(orders)
-
-    flat_orders = structured_orders_to_flat(
-        orders_tup,
-        num_modes=num_modes    
-    )
-
-    g_f = partial(gen_func, gaussian_a, gaussian_b)
-    return mixed_partial(
-        g_f,
-        flat_orders
-    )(jnp.zeros(num_modes * 4))
 
 # --- [Physical Constants and Model Definition] ---
 
@@ -213,6 +183,7 @@ def covariance_sum_inv(covariance_params_a, covariance_params_b):
     invs = jax.vmap(single_mode_inv)(params_a, params_b)
     return jsl.block_diag(*invs)
 
+
 def gen_func(gaussian_a, gaussian_b, Js):
     normalization_a, param_a = gaussian_a
     normalization_b, param_b = gaussian_b
@@ -253,82 +224,329 @@ def gen_func(gaussian_a, gaussian_b, Js):
     
     return normalization_a*normalization_b*prefactor * Z1 * (M_minus * C_minus + M_plus * C_plus)
 
-def single_photon_drive(gaussian_a, gaussian_b):
-    total = 0
-    total += jnp.real(S)/jnp.sqrt(2) * gen_func_partial_der(gaussian_a, gaussian_b, [(0,3,1)])
-    total -= jnp.imag(S)/jnp.sqrt(2) * gen_func_partial_der(gaussian_a, gaussian_b, [(0,2,1)])
-    return total
 
-def double_photon_drive(gaussian_a, gaussian_b):
-    total = 0
-    for i in range(1):
-        total += jnp.real(G) * (
-                gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1)]) +
-                gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,1)])
-            )
+def get_gen_func_components(gaussian_a, gaussian_b):
+    """
+    Computes the scalar arguments of the generating function (A13) at J=0.
+    These represent the full system's contribution to the exponents and phases.
+    Returns the raw dot-product values, not the final Z.
+    """
+    normalization_a, param_a = gaussian_a
+    normalization_b, param_b = gaussian_b
+    
+    # Unwrap parameters
+    mean_a, covariance_params_a = unwrap_params(param_a)
+    mean_b, covariance_params_b = unwrap_params(param_b)
+    alpha_a, beta_a = mean_a[:, ::2].flatten(), mean_a[:, 1::2].flatten()
+    alpha_b, beta_b = mean_b[:, ::2].flatten(), mean_b[:, 1::2].flatten()
+    
+    # Block diagonal covariances allow simple summation of determinants
+    num_modes = param_a.shape[0]
+    covariance_a = calculate_covariance(covariance_params_a) # (2M, 2M) but block diag
+    covariance_b = calculate_covariance(covariance_params_b)
+    covariance_sum = covariance_a + covariance_b
+    
+    # We need the inverse of the sum. For block diagonal, this is efficient.
+    # Note: For optimization, you could sum the inverses of 2x2 blocks, 
+    # but using jax.scipy.linalg for the full block-diag matrix is okay for now.
+    inv_sigma_sum = covariance_sum_inv(covariance_params_a, covariance_params_b)
 
-        total -= jnp.imag(G) * (
-            gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,2,1)]) -
-            gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,3,1)])
-        )
-    return total
+    # --- Compute Vectors at J=0 ---
+    # v1 at J=0 is just (alpha' - alpha)
+    v1_0 = alpha_b - alpha_a 
+    diff_beta = beta_b - beta_a
+    sum_beta = beta_b + beta_a
+    
+    # --- Compute Dot Products (Scalars) ---
+    # Arg Z1[cite: 590]: -0.5 * v1^T Sigma_sum^-1 v1
+    # Note: (A14) defines Z1 with the negative sign in the exp.
+    arg_Z1_0 = -0.5 * jnp.dot(v1_0, jnp.dot(inv_sigma_sum, v1_0))
+    
+    # Arg M +/-[cite: 593, 595]: 0.5 * beta_diff^T Sigma_sum^-1 beta_diff
+    arg_M_minus = 0.5 * jnp.dot(diff_beta, jnp.dot(inv_sigma_sum, diff_beta))
+    arg_M_plus  = 0.5 * jnp.dot(sum_beta,  jnp.dot(inv_sigma_sum, sum_beta))
+    
+    # Arg C +/-: (beta +/- beta)^T Sigma_sum^-1 (alpha' - alpha)
+    # Note: J=0 removes the J^T terms.
+    inv_sigma_v1_0 = jnp.dot(inv_sigma_sum, v1_0)
+    arg_C_minus_0 = -jnp.dot(diff_beta, inv_sigma_v1_0) # First term J^T beta is 0
+    arg_C_plus_0  =  jnp.dot(sum_beta,  inv_sigma_v1_0)
+    
+    # Prefactor (Normalization + Determinant)
+    sign, logdet = jnp.linalg.slogdet(covariance_sum)
+    log_denominator = 0.5 * (2 * num_modes * jnp.log(2 * jnp.pi) + logdet)
+    # The prefactor exp also has a J term (num_exponent), at J=0 it is 0.
+    log_prefactor = -log_denominator
+    
+    base_prefactor = 0.5*normalization_a * normalization_b * jnp.exp(log_prefactor)
+    
+    return base_prefactor, arg_Z1_0, arg_M_minus, arg_M_plus, arg_C_minus_0, arg_C_plus_0
 
-def delta_term(gaussian_a, gaussian_b):
-    total = 0
+
+def gen_func_local_correct(gaussian_a_slice, gaussian_b_slice, global_components, Js_slice):
+    """
+    Computes Eq (A13) by adding local J-dependent deviations to the global baseline.
+    Only involves dot products of size (2*k), where k is number of active modes.
+    """
+    # Unpack Global Baselines (Constants wrt J)
+    base_prefactor, arg_Z1_glob, arg_M_minus_glob, arg_M_plus_glob, arg_C_minus_glob, arg_C_plus_glob = global_components
+    
+    # Unpack Local Slice Params
+    norm_a, param_a = gaussian_a_slice # norm is dummy 1.0
+    norm_b, param_b = gaussian_b_slice
+    
+    mean_a, cov_p_a = unwrap_params(param_a)
+    mean_b, cov_p_b = unwrap_params(param_b)
+    
+    # Flatten local arrays
+    alpha_a, beta_a = mean_a[:, ::2].flatten(), mean_a[:, 1::2].flatten()
+    alpha_b, beta_b = mean_b[:, ::2].flatten(), mean_b[:, 1::2].flatten()
+    
+    # Local Matrices
+    cov_a = calculate_covariance(cov_p_a)
+    inv_sigma_sum = covariance_sum_inv(cov_p_a, cov_p_b) # Local inverse
+    
+    J, J_tilde = Js_slice[:Js_slice.size//2], Js_slice[Js_slice.size//2:]
+    
+    # --- 1. Compute Local Args at J=0 (To Subtract) ---
+    v1_0 = alpha_b - alpha_a
+    diff_beta = beta_b - beta_a
+    sum_beta = beta_b + beta_a
+    
+    inv_sigma_v1_0 = jnp.dot(inv_sigma_sum, v1_0)
+    
+    local_arg_Z1_0 = -0.5 * jnp.dot(v1_0, inv_sigma_v1_0)
+    # M terms do not depend on J, so Global M is exact. No deviation needed.
+    local_arg_C_minus_0 = -jnp.dot(diff_beta, inv_sigma_v1_0)
+    local_arg_C_plus_0  =  jnp.dot(sum_beta,  inv_sigma_v1_0)
+
+    # --- 2. Compute Local Args at J (To Add) ---
+    # v1(J) = (alpha' - alpha) - Cov_a J - J_tilde [cite: 574]
+    v1_J = v1_0 - jnp.dot(cov_a, J) - J_tilde
+    
+    inv_sigma_v1_J = jnp.dot(inv_sigma_sum, v1_J)
+    
+    local_arg_Z1_J = -0.5 * jnp.dot(v1_J, inv_sigma_v1_J)
+    
+    # C args: J^T beta +/- beta_terms 
+    J_dot_beta = jnp.dot(J, beta_a)
+    mix_minus = jnp.dot(diff_beta, inv_sigma_v1_J)
+    mix_plus  = jnp.dot(sum_beta,  inv_sigma_v1_J)
+    
+    local_arg_C_minus_J = J_dot_beta - mix_minus
+    local_arg_C_plus_J  = J_dot_beta + mix_plus
+    
+    # --- 3. Compute Prefactor Deviation ---
+    # num_exponent 
+    local_num_exponent = 0.5 * jnp.dot(J, jnp.dot(cov_a, J)) + jnp.dot(J, alpha_a)
+
+    # --- 4. Reconstruct Total Args ---
+    # Effective = Global + (Local_J - Local_0)
+    
+    eff_arg_Z1 = arg_Z1_glob + (local_arg_Z1_J - local_arg_Z1_0)
+    
+    # M terms are constant in J, so just use global
+    eff_arg_M_minus = arg_M_minus_glob
+    eff_arg_M_plus  = arg_M_plus_glob
+    
+    eff_arg_C_minus = arg_C_minus_glob + (local_arg_C_minus_J - local_arg_C_minus_0)
+    eff_arg_C_plus  = arg_C_plus_glob  + (local_arg_C_plus_J  - local_arg_C_plus_0)
+    
+    # Prefactor deviation
+    eff_prefactor = base_prefactor * jnp.exp(local_num_exponent)
+    
+    # --- 5. Final Assembly (A13) ---
+    Z1 = jnp.exp(eff_arg_Z1)
+    M_minus = jnp.exp(eff_arg_M_minus)
+    M_plus  = jnp.exp(eff_arg_M_plus)
+    
+    return eff_prefactor * Z1 * (M_minus * jnp.cos(eff_arg_C_minus) + 
+                                 M_plus  * jnp.cos(eff_arg_C_plus))
+
+def compute_local_derivative(gaussian_a, gaussian_b, global_components, site_idx, orders_list):
+    """
+    Applies derivatives specified in orders_list to a single site 'site_idx'.
+    orders_list: List of tuples (0, phase, power). Note site is always 0 relative to the slice.
+    """
+    norm_a, param_a = gaussian_a
+    norm_b, param_b = gaussian_b
+    
+    # Slice 1 mode
+    p_a_slice = jax.lax.dynamic_slice(param_a, (site_idx, 0), (1, 6))
+    p_b_slice = jax.lax.dynamic_slice(param_b, (site_idx, 0), (1, 6))
+    
+    g_a_slice = (1.0, p_a_slice)
+    g_b_slice = (1.0, p_b_slice)
+    
+    def local_wrapper(Js_slice):
+        return gen_func_local_correct(g_a_slice, g_b_slice, global_components, Js_slice)
+    
+    # Convert structured orders to flat index for 1 mode (dim=4)
+    flat_orders = structured_orders_to_flat(tuple(orders_list), num_modes=1)
+    
+    return mixed_partial(local_wrapper, flat_orders)(jnp.zeros(4))
+
+def single_photon_drive_optimized(gaussian_a, gaussian_b, global_components):
     num_modes = gaussian_a[1].shape[0]
+    
+    def site_term(i):
+        term1 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,3,1)])
+        term2 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,2,1)])
+        return jnp.real(S)/jnp.sqrt(2) * term1 - jnp.imag(S)/jnp.sqrt(2) * term2
 
-    for i in range(num_modes):
-        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1)]) - gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,1)])
-    return delta * total
+    return site_term(0)
 
-def u_term(gaussian_a, gaussian_b):
-    total = 0
+def double_photon_drive_optimized(gaussian_a, gaussian_b, global_components):
     num_modes = gaussian_a[1].shape[0]
+    
+    def site_term(i):
+        # G * (a^dag^2) terms
+        t1 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,1), (0,2,1)])
+        t2 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,3,1)])
+        
+        # G_conj * (a^2) terms
+        t3 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,2,1)])
+        t4 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,1), (0,3,1)])
+        
+        return jnp.real(G) * (t1 + t2) - jnp.imag(G) * (t3 - t4)
 
-    for i in range(num_modes):
-        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,3), (i,3,1)])
-        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,1,2), (i,3,1)])
-        total += -gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,2), (i,1,1), (i,2,1)])
-        total += -gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,3), (i,2,1)])
-        total += 2 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1)])
-        total += -2 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,1)])
-        total += 0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,3)])
-        total += -0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,3,3)])
-        total += -0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,2,2), (i,3,1)])
-        total += 0.25 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,2,1), (i,3,2)])
-    return U / 2 * total
+    return site_term(0)
 
-def single_photon_loss_term(gaussian_a, gaussian_b):
-    total = 0
+def delta_term_optimized(gaussian_a, gaussian_b, global_components):
     num_modes = gaussian_a[1].shape[0]
-    for i in range(num_modes):
-        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i,2,1)])
-        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i,3,1)])
-        total += 2 * gen_func_partial_der(gaussian_a, gaussian_b, [])
-        total += 0.5 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,2,2)])
-        total += 0.5 * gen_func_partial_der(gaussian_a, gaussian_b, [(i,3,2)])   
-    return gamma / 2 * total
+    
+    def site_term(i):
+        t1 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,1), (0,2,1)])
+        t2 = compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,3,1)])
+        return t1 - t2
 
-def hopping_term(gaussian_a, gaussian_b):
-    total = 0
+    return delta * jnp.sum(jax.vmap(site_term)(jnp.arange(num_modes)))
+
+def u_term_optimized(gaussian_a, gaussian_b, global_components):
     num_modes = gaussian_a[1].shape[0]
-    for i in range(num_modes-1):
-        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i,0,1), (i+1,3,1)])
-        total += gen_func_partial_der(gaussian_a, gaussian_b, [(i+1,0,1), (i,3,1)])
-        total -= gen_func_partial_der(gaussian_a, gaussian_b, [(i,1,1), (i+1,2,1)])
-        total -= gen_func_partial_der(gaussian_a, gaussian_b, [(i+1,1,1), (i,2,1)])
-    return -J * total
+    
+    def site_term(i):
+        total = 0
+        total += compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,3), (0,3,1)])
+        total += compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,1,2), (0,3,1)])
+        total += -compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,2), (0,1,1), (0,2,1)])
+        total += -compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,3), (0,2,1)])
+        total += 2 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,1), (0,2,1)])
+        total += -2 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,3,1)])
+        total += 0.25 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,1), (0,2,3)])
+        total += -0.25 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,3,3)])
+        total += -0.25 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,2,2), (0,3,1)])
+        total += 0.25 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,1), (0,2,1), (0,3,2)])
+        return total
 
-def all_terms(gaussians_a, gaussians_b):
+    return U/2 * jnp.sum(jax.vmap(site_term)(jnp.arange(num_modes)))
+
+def single_photon_loss_term_optimized(gaussian_a, gaussian_b, global_components):
+    num_modes = gaussian_a[1].shape[0]
+    
+    def site_term(i):
+        total = 0
+        total += compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,0,1), (0,2,1)])
+        total += compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,1,1), (0,3,1)])
+        # For the constant term '2*W', we calculate the 0-th order deriv which is just the function value
+        total += 2 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [])
+        total += 0.5 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,2,2)])
+        total += 0.5 * compute_local_derivative(gaussian_a, gaussian_b, global_components, i, [(0,3,2)])    
+        return total
+
+    return gamma / 2 * jnp.sum(jax.vmap(site_term)(jnp.arange(num_modes)))
+
+def all_terms_optimized(gaussians_a, gaussians_b):
     norms_a, params_a = gaussians_a
     norms_b, params_b = gaussians_b
-    def func(gaussian_a, gaussian_b):
-        return double_photon_drive(gaussian_a, gaussian_b) + delta_term(gaussian_a, gaussian_b) + u_term(gaussian_a, gaussian_b) + single_photon_loss_term(gaussian_a, gaussian_b) + hopping_term(gaussian_a, gaussian_b) + single_photon_drive(gaussian_a, gaussian_b)
-    return jnp.sum(jax.vmap(lambda g_a: jax.vmap(lambda g_b: func(g_a, g_b))((norms_b, params_b)))((norms_a, params_a)))
+    
+    def pair_func(gaussian_a, gaussian_b):
+        # 1. Compute Global Overlap Scalars (O(N) cost, but no differentiation)
+        global_components = get_gen_func_components(gaussian_a, gaussian_b)
+        
+        # 2. Compute sums of O(1) local derivatives
+        val = 0
+        val += double_photon_drive_optimized(gaussian_a, gaussian_b, global_components)
+        val += delta_term_optimized(gaussian_a, gaussian_b, global_components)
+        val += u_term_optimized(gaussian_a, gaussian_b, global_components)
+        val += single_photon_loss_term_optimized(gaussian_a, gaussian_b, global_components)
+        val += single_photon_drive_optimized(gaussian_a, gaussian_b, global_components)
+        val += hopping_term_optimized(gaussian_a, gaussian_b) # Use the version from previous answer
+        return val
 
+    # Vmap over the NxN pairs
+    matrix_elements = jax.vmap(lambda g_a: jax.vmap(lambda g_b: pair_func(g_a, g_b))(gaussians_b))(gaussians_a)
+    return jnp.sum(matrix_elements)
+
+
+def hopping_term_optimized(gaussian_a, gaussian_b):
+    num_modes = gaussian_a[1].shape[0]
+
+    # 1. Compute Global Scalars (O(N)) - No Derivatives here!
+    global_components = get_gen_func_components(gaussian_a, gaussian_b)
+    
+    def site_term(i):
+        # 2. Slice Params (O(1))
+        norm_a, param_a = gaussian_a
+        norm_b, param_b = gaussian_b
+        
+        # Take modes i and i+1
+        p_a_slice = jax.lax.dynamic_slice(param_a, (i, 0), (2, 6))
+        p_b_slice = jax.lax.dynamic_slice(param_b, (i, 0), (2, 6))
+        
+        g_a_slice = (1.0, p_a_slice) # Dummy norm
+        g_b_slice = (1.0, p_b_slice)
+        
+        # 3. Define function to differentiate
+        def local_wrapper(Js_slice):
+            return gen_func_local_correct(g_a_slice, g_b_slice, global_components, Js_slice)
+
+        # 4. Compute mixed partials using only 2 modes! (O(1))
+        # Note: orders must refer to indices 0 and 1 (relative to slice)
+        # Term: a_i^dag a_{i+1} -> partials on slice indices 0 and 1
+        
+        # Orders for -J * (a_i^dag a_{i+1} + a_{i+1}^dag a_i)
+        # Indices in slice: i -> 0, i+1 -> 1
+        
+        # a_0^dag a_1: (0,0,1), (1,3,1)
+        term1 = mixed_partial(local_wrapper, structured_orders_to_flat(((0,0,1), (1,3,1)), 2))(jnp.zeros(8))
+        
+        # a_1^dag a_0: (1,0,1), (0,3,1)
+        term2 = mixed_partial(local_wrapper, structured_orders_to_flat(((1,0,1), (0,3,1)), 2))(jnp.zeros(8))
+        
+        # - a_0 a_1^dag (from commutation? check your old_hopping_term logic)
+        # Your old code had: -gen_func... [(i,1,1), (i+1,2,1)]
+        term3 = mixed_partial(local_wrapper, structured_orders_to_flat(((0,1,1), (1,2,1)), 2))(jnp.zeros(8))
+        
+        term4 = mixed_partial(local_wrapper, structured_orders_to_flat(((1,1,1), (0,2,1)), 2))(jnp.zeros(8))
+        
+        return -J * (term1 + term2 - term3 - term4)
+
+    return jnp.sum(jax.vmap(site_term)(jnp.arange(num_modes - 1)))
+
+def all_terms_optimized(gaussians_a, gaussians_b):
+    norms_a, params_a = gaussians_a
+    norms_b, params_b = gaussians_b
+    
+    def pair_func(gaussian_a, gaussian_b):
+        # 1. Compute Global Overlap Scalars (O(N) cost, but no differentiation)
+        global_components = get_gen_func_components(gaussian_a, gaussian_b)
+        # 2. Compute sums of O(1) local derivatives
+        val = 0
+        val += double_photon_drive_optimized(gaussian_a, gaussian_b, global_components)
+        val += delta_term_optimized(gaussian_a, gaussian_b, global_components)
+        val += u_term_optimized(gaussian_a, gaussian_b, global_components)
+        val += single_photon_loss_term_optimized(gaussian_a, gaussian_b, global_components)
+        val += single_photon_drive_optimized(gaussian_a, gaussian_b, global_components)
+        val += hopping_term_optimized(gaussian_a, gaussian_b) # Use the version from previous answer
+        return val
+
+    # Vmap over the NxN pairs
+    matrix_elements = jax.vmap(lambda g_a: jax.vmap(lambda g_b: pair_func(g_a, g_b))(gaussians_b))(gaussians_a)
+    return jnp.sum(matrix_elements)
 
 def liouvillian_gradient(gaussians):
-    return jax.grad(all_terms, argnums=0)(gaussians, gaussians)
+    return jax.grad(all_terms_optimized, argnums=0)(gaussians, gaussians)
 
 def geometric_tensor(gaussians):
     norms, params = gaussians
@@ -347,6 +565,49 @@ def geometric_tensor(gaussians):
     T_bot = jnp.hstack([T_pn_mat, T_pp_mat])
     T_mat = jnp.vstack([T_top, T_bot])
     return T_mat
+
+def test_geometric_tensor(gaussians):
+    """
+    Computes the Geometric Tensor using serialized Forward-over-Reverse AD.
+    Memory usage: Constant (does not scale with number of parameters).
+    """
+    # 1. Flatten parameters to treat them as a single vector
+    flat_params, unravel_fn = ravel_pytree(gaussians)
+    num_params = flat_params.size
+    
+    # 2. Define the function: Bra_Params -> Gradient_wrt_Ket_Params
+    # We want the Jacobian of THIS function.
+    def gradient_wrt_ket(bra_params_flat):
+        bra_pytree = unravel_fn(bra_params_flat)
+        
+        # We differentiate total_gen_func wrt the Ket (arg1), holding Bra (arg0) fixed
+        # But arg0 is the input to this wrapper 'gradient_wrt_ket'
+        def scalar_overlap(ket_pytree):
+            # Recalculate total_gen_func sum logic here to ensure scoping
+            # Note: We must replicate the summation logic from your original function
+            return jnp.sum(jax.vmap(lambda g_a: jax.vmap(lambda g_b: gen_func(g_a, g_b, jnp.zeros(4*num_modes)))(bra_pytree))(ket_pytree))
+
+        # Compute gradient wrt Ket (arg1)
+        # This returns a PyTree of size P
+        grad_pytree = jax.grad(scalar_overlap)(gaussians) 
+        
+        # Flatten output to vector
+        return ravel_pytree(grad_pytree)[0]
+
+    # 3. Define the Matrix-Vector Product (One Column of T)
+    # T @ v = JVP( gradient_wrt_ket, v )
+    def get_column(v):
+        # jvp performs Forward-Mode AD: efficient and no extra tape overhead
+        _, col = jax.jvp(gradient_wrt_ket, (flat_params,), (v,))
+        return col
+
+    # 4. Serialize execution with lax.map
+    # Instead of computing all 1460 columns at once, we do them one by one.
+    # This prevents the memory explosion.
+    basis = jnp.eye(num_params)
+    T_flat = jax.lax.map(get_column, basis)
+    
+    return T_flat
 
 def renormalize(normalizations):
     return normalizations/jnp.sum(normalizations)
@@ -455,7 +716,7 @@ def plot_wigner(gaussians, filename, exact_state=None):
     plt.savefig(filename)
     plt.close()
 
-#@jax.jit(static_argnums=(2))
+@jax.jit(static_argnums=(2))
 def compute_update_step(t, gaussians, args):
     V_pytree = liouvillian_gradient(gaussians)
     d_norms, d_params = V_pytree
@@ -472,6 +733,84 @@ def compute_update_step(t, gaussians, args):
     d_params_new = d_combined[N:].reshape(N, num_modes, 6)
     
     return (d_norms_new, d_params_new)
+
+def geometric_tensor_batched(gaussians, batch_size=100):
+    """
+    Computes Geometric Tensor in batches.
+    Correctly handles shapes and vmapping over batches.
+    """
+    flat_params, unravel_fn = ravel_pytree(gaussians)
+    num_params = flat_params.size
+    
+    # 1. Pad the *Number of Vectors* (Rows), NOT the vector size (Cols)
+    remainder = num_params % batch_size
+    if remainder != 0:
+        pad_rows = batch_size - remainder
+        # Create standard (N, N) identity
+        basis = jnp.eye(num_params)
+        # Pad only the bottom rows with zeros to make total rows divisible by batch_size
+        # Result shape: (N + pad, N)
+        basis_padded = jnp.pad(basis, ((0, pad_rows), (0, 0)))
+    else:
+        basis_padded = jnp.eye(num_params)
+
+    # 2. Reshape into batches: (Num_Batches, Batch_Size, Param_Dim)
+    num_batches = basis_padded.shape[0] // batch_size
+    basis_batches = basis_padded.reshape(num_batches, batch_size, num_params)
+
+    # 3. Define the Core Gradient Function
+    def gradient_wrt_ket(bra_params_flat):
+        bra_pytree = unravel_fn(bra_params_flat)
+        def scalar_overlap(ket_pytree):
+            # Recalculate overlap sum
+            # Note: Ensure global 'gen_func' and 'num_modes' are accessible or passed in
+            return jnp.sum(jax.vmap(lambda g_a: jax.vmap(lambda g_b: gen_func(g_a, g_b, jnp.zeros(4*num_modes)))(bra_pytree))(ket_pytree))
+        
+        grad_pytree = jax.grad(scalar_overlap)(gaussians)
+        return ravel_pytree(grad_pytree)[0]
+
+    # 4. Process Batch Function
+    def process_batch(batch_tangents):
+        # batch_tangents shape: (Batch_Size, num_params)
+        
+        # We must VMAP the JVP to handle the batch dimension (128)
+        # jvp(func, primals, tangents)
+        # primals is fixed (flat_params), tangents varies
+        def jvp_wrapper(t):
+            _, res = jax.jvp(gradient_wrt_ket, (flat_params,), (t,))
+            return res
+        
+        return jax.vmap(jvp_wrapper)(batch_tangents)
+
+    # 5. Execute Map
+    # jax.lax.map executes sequentially to save memory
+    T_flat_batched = jax.lax.map(process_batch, basis_batches)
+    
+    # 6. Reshape and Trim
+    # Flatten batches back to matrix rows: (N_padded, N)
+    T_flat = T_flat_batched.reshape(-1, num_params)
+    
+    # Remove the padding rows we added in step 1
+    T_flat = T_flat[:num_params, :]
+    
+    return T_flat
+
+@jax.jit(static_argnums=(2))
+def test_compute_update_step(t, gaussians, args):
+    # 1. Compute Gradient (V)
+    V_pytree = liouvillian_gradient(gaussians)
+    V_flat, unravel_fn = ravel_pytree(V_pytree)
+    
+    # 2. Compute Metric Tensor (T) - Now memory safe
+    T = geometric_tensor_batched(gaussians)
+    
+    # 3. Solve (Add jitter for numerical stability)
+    d_combined = jla.solve(T + 1e-12 * jnp.eye(T.shape[0]), V_flat)
+    
+    # 4. Unflatten
+    d_norms, d_params = unravel_fn(d_combined)
+    
+    return (d_norms, d_params)
 
 def plot_observables(data, num_modes, exact_result=None, filename="observables.png"):
     fig, ax = plt.subplots(1, 2, figsize=(18, 5))
@@ -541,7 +880,7 @@ def time_evolve(initial_time, end_time, initial_gaussians):
 
     # Log initial observables
     print(f"Starting integration from t={initial_time} to {end_time}...")
-    term = ODETerm(compute_update_step)
+    term = ODETerm(test_compute_update_step)
     solver = diffrax.Dopri8()
     saveat = SaveAt(ts=t_eval)
 
@@ -877,17 +1216,19 @@ def l2_prune_params(original_gaussians, initial_gaussians, target_n_gaussians, o
     
     return gaussians_optimized
 
-end_time = 0.1
-num_modes = 2
+end_time = 0.5
+num_modes = 30
 t_eval = np.linspace(0.0, end_time, 300)
-exact_result = exact_simulation(end_time, num_sites=num_modes, t_eval=t_eval)
+#exact_result = exact_simulation(end_time, num_sites=num_modes, t_eval=t_eval)
 
 gaussians = initialize_vacuum_state(N_G=1, num_modes=num_modes)
-gaussians = expand_state_cluster(gaussians, expansion_factor=60, noise_scale=1e-2)
-gaussians = l2_prune_params(gaussians, gaussians, target_n_gaussians=40, optimization_steps=2000, lr=0.02)
+gaussians = expand_state_cluster(gaussians, expansion_factor=30, noise_scale=1e-2)
+
+#gaussians = l2_prune_params(gaussians, gaussians, target_n_gaussians=30, optimization_steps=2000, lr=0.02)
+
 
 sol = time_evolve(0, end_time, gaussians)
 final_state = jax.tree.map(lambda x: x[-1], sol.ys)
-plot_wigner(final_state, "final_state.png", exact_state=exact_result.states[-1])
-plot_observables([(sol.ts, sol.ys)], num_modes, filename="observables.png", exact_result=exact_result)
-animate_wigner(sol.ys, "animation.mp4", t_eval=sol.ts, exact_states=exact_result.states)
+plot_wigner(final_state, "final_state.png")
+plot_observables([(sol.ts, sol.ys)], num_modes, filename="observables.png")
+#animate_wigner(sol.ys, "animation.mp4", t_eval=sol.ts, exact_states=exact_result.states)
